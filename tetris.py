@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from collections import Counter
 import time
 
 import cv2
@@ -221,8 +222,6 @@ def main(args):
     calibration = load_calibration()
     playfield = calibration["playfield"]
     next_box = calibration["next_box"]
-    # CLI --source/--camera-index override whatever is stored in the
-    # calibration file (previously these args were parsed but never used).
     source = args.source or calibration.get("source", "screen")
 
     if source == "camera":
@@ -243,7 +242,9 @@ def main(args):
     win_name = "Shape-Only Tetris Detector"
     cv2.namedWindow(win_name)
 
-    last_falling, last_next = None, None
+    window_start = time.time()
+    falling_buffer = []
+    next_buffer = []
 
     while True:
         ret, frame = capturer.read()
@@ -254,9 +255,22 @@ def main(args):
         falling_shape = detect_falling_shape(frame, pf_rel)
         next_shape = detect_next_shape(frame, nb_rel)
 
-        if falling_shape != last_falling or next_shape != last_next:
-            print(f"Falling piece: {falling_shape}. Next piece: {next_shape}")
-            last_falling, last_next = falling_shape, next_shape
+        # Collect samples continuously
+        falling_buffer.append(falling_shape)
+        next_buffer.append(next_shape)
+
+        current_time = time.time()
+        if current_time - window_start >= 1.0:
+            # Get the most common shape detected during the last second
+            best_falling = Counter(falling_buffer).most_common(1)[0][0] if falling_buffer else 'UNKNOWN'
+            best_next = Counter(next_buffer).most_common(1)[0][0] if next_buffer else 'UNKNOWN'
+
+            print(f"Falling piece: {best_falling}. Next piece: {best_next}")
+
+            # Reset buffers for the next 1-second window
+            window_start = current_time
+            falling_buffer = []
+            next_buffer = []
 
         cv2.rectangle(frame, (pf_rel["left"], pf_rel["top"]),
                       (pf_rel["left"] + pf_rel["width"], pf_rel["top"] + pf_rel["height"]), (0, 255, 0), 2)

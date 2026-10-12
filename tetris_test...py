@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from collections import Counter
 import time
 
 import cv2
@@ -9,11 +10,10 @@ import numpy as np
 # ==========================================
 # 1. IMPORT YOUR CHAMPION AI ENGINE
 # ==========================================
-from tetris_trainer import find_best_move
+from tetris_trainer import find_best_move 
 
-# Update these with your final CSV champion numbers!
-CHAMPION_DNA = {
-    'lines_1': -150.0,
+CHAMPION_DNA = { # rewards/punishments for the AI each time a move is made.
+    'lines_1': -150.0, 
     'lines_2': -50.0,
     'lines_3': 10.0,
     'lines_4': 5000.0,
@@ -22,6 +22,7 @@ CHAMPION_DNA = {
     'bumpiness': 2.0,
     'wells': 15.0
 }
+SPAWN_COLUMN = 3
 
 try:
     import mss
@@ -33,29 +34,63 @@ CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cal
 BOARD_COLS = 10
 BOARD_ROWS = 20
 
-# A freshly spawned piece must have its top row at or above this row,
-# and its bottom row at or above SPAWN_MAX_BOTTOM.
-SPAWN_MAX_TOP = 1
-SPAWN_MAX_BOTTOM = 3
-
 PIECE_TEMPLATES = {
-    'I': [np.array([[1, 1, 1, 1]]), np.array([[1], [1], [1], [1]])],
-    'O': [np.array([[1, 1], [1, 1]])],
-    'T': [np.array([[1, 1, 1], [0, 1, 0]]), np.array([[0, 1], [1, 1], [0, 1]]),
-          np.array([[0, 1, 0], [1, 1, 1]]), np.array([[1, 0], [1, 1], [1, 0]])],
-    'S': [np.array([[0, 1, 1], [1, 1, 0]]), np.array([[1, 0], [1, 1], [0, 1]])],
-    'Z': [np.array([[1, 1, 0], [0, 1, 1]]), np.array([[0, 1], [1, 1], [1, 0]])],
-    'J': [np.array([[1, 0, 0], [1, 1, 1]]), np.array([[1, 1], [1, 0], [1, 0]]),
-          np.array([[1, 1, 1], [0, 0, 1]]), np.array([[0, 1], [0, 1], [1, 1]])],
-    'L': [np.array([[0, 0, 1], [1, 1, 1]]), np.array([[1, 0], [1, 0], [1, 1]]),
-          np.array([[1, 1, 1], [1, 0, 0]]), np.array([[1, 1], [0, 1], [0, 1]])]
+    'I': [np.array([[1, 1, 1, 1]]), 
+          np.array([[1], 
+                    [1], 
+                    [1], 
+                    [1]])],
+
+    'O': [np.array([[1, 1], 
+                    [1, 1]])],
+
+    'T': [np.array([[1, 1, 1], 
+                    [0, 1, 0]]), 
+            np.array([[0, 1], 
+                      [1, 1], 
+                      [0, 1]]), 
+            np.array([[0, 1, 0], 
+                      [1, 1, 1]]), 
+            np.array([[1, 0], 
+                      [1, 1], 
+                      [1, 0]])],
+
+    'S': [np.array([[0, 1, 1], 
+                    [1, 1, 0]]), 
+            np.array([[1, 0], 
+                      [1, 1], 
+                      [0, 1]])],
+
+    'Z': [np.array([[1, 1, 0], 
+                    [0, 1, 1]]), 
+          np.array([[0, 1], 
+                    [1, 1], 
+                    [1, 0]])],
+
+    'L': [np.array([[1, 0, 0], 
+                    [1, 1, 1]]), 
+          np.array([[1, 1], 
+                    [1, 0], 
+                    [1, 0]]), 
+          np.array([[1, 1, 1], 
+                    [0, 0, 1]]), 
+          np.array([[0, 1], 
+                    [0, 1], 
+                    [1, 1]])],
+
+    'J': [np.array([[0, 0, 1], 
+                    [1, 1, 1]]), 
+          np.array([[1, 0], 
+                    [1, 0], 
+                    [1, 1]]), 
+          np.array([[1, 1, 1], 
+                    [1, 0, 0]]), 
+          np.array([[1, 1], 
+                    [0, 1], 
+                    [0, 1]])]
 }
 
 FUZZY_MATCH_THRESHOLD = 0.75
-
-# Possible (rows, cols) bounding boxes of a tetromino, used for the next-piece box
-NEXT_BOX_DIMS = [(1, 4), (4, 1), (2, 2), (2, 3), (3, 2)]
-
 
 # ==========================================
 # 2. ACTION SEQUENCER (FOR HUMAN CONTROL)
@@ -111,9 +146,6 @@ def load_calibration():
         return json.load(f)
 
 
-# ==========================================
-# 3. VISION
-# ==========================================
 def scan_binary_grid(crop, cols, rows):
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -133,21 +165,18 @@ def scan_binary_grid(crop, cols, rows):
     return grid
 
 
-def find_new_piece(grid):
-    """Return a full-size (20x10) mask of a freshly spawned 4-cell piece, or None.
-
-    Only accepts a connected component of exactly 4 cells that sits in the
-    spawn rows. Partial pieces, stack fragments and merged blobs are ignored.
-    """
-    n, labels = cv2.connectedComponents(grid.astype(np.uint8), connectivity=4)
-    for label in range(1, n):
-        mask = labels == label
-        if mask.sum() != 4:
-            continue
-        rows = np.where(mask)[0]
-        if rows.min() <= SPAWN_MAX_TOP and rows.max() <= SPAWN_MAX_BOTTOM:
-            return mask.astype(int)
-    return None
+def find_falling_piece_component(grid, search_rows=12):
+    top = grid[:search_rows].astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(top, connectivity=4)
+    best_label, best_size = None, 0
+    for label in range(1, num_labels):
+        size = int(np.sum(labels == label))
+        if 3 <= size <= 4 and size > best_size:
+            best_size = size
+            best_label = label
+    if best_label is None:
+        return None
+    return (labels == best_label).astype(int)
 
 
 def match_shape_matrix(matrix):
@@ -173,99 +202,40 @@ def match_shape_matrix(matrix):
 
 
 def detect_falling_shape(frame, rect):
-    """Returns (shape, full_grid, full_mask). Mask is always the same size as grid."""
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
     crop = frame[y:y + h, x:x + w]
     if crop.size == 0:
         return 'UNKNOWN', None, None
 
     grid = scan_binary_grid(crop, BOARD_COLS, BOARD_ROWS)
-    mask = find_new_piece(grid)
+    mask_top = find_falling_piece_component(grid, search_rows=12)
+    
+    # Create full-size board mask (20, 10) to match grid dimensions
+    mask = np.zeros_like(grid)
+    if mask_top is not None:
+        mask[:12, :] = mask_top
 
-    if mask is None:
-        return 'UNKNOWN', grid, np.zeros_like(grid)
+    if mask_top is None:
+        return 'UNKNOWN', grid, mask
 
-    r, c = np.where(mask == 1)
-    shape = match_shape_matrix(mask[r.min():r.max() + 1, c.min():c.max() + 1])
+    rows_idx, cols_idx = np.where(mask_top == 1)
+    min_r, max_r = rows_idx.min(), rows_idx.max()
+    min_c, max_c = cols_idx.min(), cols_idx.max()
+    piece_subgrid = mask_top[min_r:max_r + 1, min_c:max_c + 1]
+
+    shape = match_shape_matrix(piece_subgrid)
     return shape, grid, mask
 
 
 def detect_next_shape(frame, rect):
-    """Detect the piece in the preview box without assuming a fixed 4x4 layout.
-
-    Finds the bounding box of the lit pixels, picks the tetromino bounding-box
-    size (1x4, 2x2, 2x3...) whose cells come out most square, then samples
-    each cell inside that box.
-    """
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
     crop = frame[y:y + h, x:x + w]
     if crop.size == 0:
         return 'UNKNOWN'
-
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Pieces should be the minority of pixels; if not, polarity is inverted
-    if np.count_nonzero(thresh) > thresh.size * 0.5:
-        thresh = cv2.bitwise_not(thresh)
-
-    # Drop specks of noise
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-    ys, xs = np.where(thresh > 0)
-    if len(xs) < 20:
-        return 'UNKNOWN'
-
-    x0, x1 = xs.min(), xs.max() + 1
-    y0, y1 = ys.min(), ys.max() + 1
-    bw, bh = x1 - x0, y1 - y0
-    if bw < 4 or bh < 4:
-        return 'UNKNOWN'
-
-    best_dims, best_err = None, 1e9
-    for rows, cols in NEXT_BOX_DIMS:
-        cw, ch = bw / cols, bh / rows
-        err = abs(cw - ch) / max(cw, ch)
-        if err < best_err:
-            best_err, best_dims = err, (rows, cols)
-    if best_dims is None or best_err > 0.35:
-        return 'UNKNOWN'
-
-    rows, cols = best_dims
-    cw, ch = bw / cols, bh / rows
-    grid = np.zeros((rows, cols), dtype=int)
-    for r in range(rows):
-        for c in range(cols):
-            cx = int(x0 + c * cw + cw / 2)
-            cy = int(y0 + r * ch + ch / 2)
-            hw, hh = max(1, int(cw * 0.25)), max(1, int(ch * 0.25))
-            patch = thresh[cy - hh:cy + hh + 1, cx - hw:cx + hw + 1]
-            if patch.size > 0 and np.count_nonzero(patch) / patch.size > 0.5:
-                grid[r, c] = 1
-
-    if grid.sum() != 4:
-        return 'UNKNOWN'
+    grid = scan_binary_grid(crop, 4, 4)
     return match_shape_matrix(grid)
 
 
-def print_grid(grid, mask=None):
-    for r in range(grid.shape[0]):
-        line = ""
-        for c in range(grid.shape[1]):
-            if mask is not None and mask[r, c]:
-                line += "@"
-            elif grid[r, c]:
-                line += "#"
-            else:
-                line += "."
-        print(line)
-    print()
-
-
-# ==========================================
-# 4. MAIN LOOP
-# ==========================================
 def main(args):
     calibration = load_calibration()
     playfield = calibration["playfield"]
@@ -284,102 +254,109 @@ def main(args):
         region = {"left": left, "top": top, "width": right - left, "height": bottom - top}
 
         capturer = ScreenCapture(region)
-        pf_rel = {"left": playfield["left"] - left, "top": playfield["top"] - top,
-                  "width": playfield["width"], "height": playfield["height"]}
-        nb_rel = {"left": next_box["left"] - left, "top": next_box["top"] - top,
-                  "width": next_box["width"], "height": next_box["height"]}
+        pf_rel = {"left": playfield["left"] - left, "top": playfield["top"] - top, "width": playfield["width"], "height": playfield["height"]}
+        nb_rel = {"left": next_box["left"] - left, "top": next_box["top"] - top, "width": next_box["width"], "height": next_box["height"]}
 
     win_name = "AI Champion Controller"
     cv2.namedWindow(win_name)
 
+    window_start = time.time()
+    falling_buffer = []
+    next_buffer = []
+    grid_buffer = []
+    mask_buffer = []
+
+    last_falling = 'UNKNOWN'
     sequencer = ActionSequencer()
     current_instructions = []
 
-    armed = True            # ready to react to the next spawn
-    last_shape = 'UNKNOWN'  # shape of the last piece we reacted to
-    last_next = 'UNKNOWN'   # last successfully read next-piece shape
-    frame_count = 0
-    full_grid, falling_mask = None, None
-
-    print("\n💜 AI Vision Engine Online! Waiting for pieces...")
-    print("Keys: q = quit, g = print the grid the vision currently sees\n")
+    print("\n💜 AI Vision Engine Online (Ignoring UNKNOWN noise)! Waiting for pieces...\n")
 
     while True:
         ret, frame = capturer.read()
         if not ret or frame is None:
             time.sleep(0.001)
             continue
-        frame_count += 1
 
+        # 1. Run vision detection frame-by-frame
         falling_shape, full_grid, falling_mask = detect_falling_shape(frame, pf_rel)
         next_shape = detect_next_shape(frame, nb_rel)
 
-        # Remember the last good next-piece reading in case a frame fails
-        if next_shape in PIECE_TEMPLATES:
-            last_next = next_shape
+        # Collect continuously into buffers
+        falling_buffer.append(falling_shape)
+        next_buffer.append(next_shape)
+        grid_buffer.append(full_grid)
+        mask_buffer.append(falling_mask)
 
-        if args.debug and frame_count % 15 == 0:
-            print(f"falling={falling_shape} next={next_shape} (held={last_next}) "
-                  f"last={last_shape} armed={armed}")
+        current_time = time.time()
+        # Every 1 second, evaluate the window
+        if current_time - window_start >= 1.0:
+            # FILTER OUT 'UNKNOWN' so noise doesn't ruin detections!
+            valid_falling_samples = [(shape, idx) for idx, shape in enumerate(falling_buffer) if shape != 'UNKNOWN']
+            valid_next_samples = [shape for shape in next_buffer if shape != 'UNKNOWN']
 
-        # Re-arm for the next spawn:
-        #  - no fresh piece visible (it dropped/merged), or
-        #  - spawn rows are empty, or
-        #  - a different shape appeared
-        if full_grid is not None:
-            if falling_shape == 'UNKNOWN' or full_grid[:2].sum() == 0:
-                armed = True
-            elif falling_shape != last_shape:
-                armed = True
+            best_falling = Counter([s[0] for s in valid_falling_samples]).most_common(1)[0][0] if valid_falling_samples else 'UNKNOWN'
+            best_next = Counter(valid_next_samples).most_common(1)[0][0] if valid_next_samples else 'UNKNOWN'
 
-        # THE AI TRIGGER
-        if armed and falling_shape in PIECE_TEMPLATES and last_next in PIECE_TEMPLATES:
-            armed = False
-            last_shape = falling_shape
+            # Find matching index for clean grid/mask from the valid samples
+            matched_idx = -1
+            for shape_val, idx in valid_falling_samples:
+                if shape_val == best_falling:
+                    matched_idx = idx
+                    break
+            
+            stable_grid = grid_buffer[matched_idx] if matched_idx != -1 else full_grid
+            stable_mask = mask_buffer[matched_idx] if matched_idx != -1 else falling_mask
 
-            # Remove the falling piece so the AI sees only the settled stack
-            settled_board = np.where(falling_mask == 1, 0, full_grid)
+            # 2. THE AI TRIGGER: If a valid piece is detected
+            if best_falling in PIECE_TEMPLATES and best_next in PIECE_TEMPLATES:
+                if best_falling != last_falling:
+                    print(f"👀 Stable Spawn Consensus: {best_falling} (Next: {best_next})")
+                    
+                    # Subtract falling piece to get the pure settled board
+                    settled_board = np.where(stable_mask == 1, 0, stable_grid)
+                    
+                    # Feed it to your Champion AI
+                    best_move, _, _ = find_best_move(settled_board.tolist(), best_falling, best_next, CHAMPION_DNA)
+                    
+                    if best_move:
+                        best_rot, best_col = best_move
+                        move_offset = best_col - SPAWN_COLUMN
+                        
+                        current_instructions = sequencer.get_full_sequence(best_falling, best_rot, move_offset)
+                        print(f"🔥 AI COMMAND: {' -> '.join(current_instructions)}\n")
+                    
+                    last_falling = best_falling
+            elif best_falling == 'UNKNOWN':
+                last_falling = 'UNKNOWN'
 
-            best_move, _, _ = find_best_move(settled_board.tolist(), falling_shape, last_next, CHAMPION_DNA)
+            # Reset buffers for the next 1-second evaluation window
+            window_start = current_time
+            falling_buffer = []
+            next_buffer = []
+            grid_buffer = []
+            mask_buffer = []
 
-            if best_move:
-                best_rot, best_col = best_move
-                spawn_col = int(np.where(falling_mask == 1)[1].min())  # detected, not hard-coded
-                move_offset = best_col - spawn_col
-
-                current_instructions = sequencer.get_full_sequence(falling_shape, best_rot, move_offset)
-                print(f"👀 Spawn: {falling_shape} (Next: {last_next})")
-                print(f"🔥 AI COMMAND: {' -> '.join(current_instructions)}\n")
-
-        elif falling_shape == 'UNKNOWN':
-            last_shape = 'UNKNOWN'
-
-        # Overlays
+        # 3. Draw overlays so you can play along
         cv2.rectangle(frame, (pf_rel["left"], pf_rel["top"]),
                       (pf_rel["left"] + pf_rel["width"], pf_rel["top"] + pf_rel["height"]), (0, 255, 0), 2)
         cv2.rectangle(frame, (nb_rel["left"], nb_rel["top"]),
                       (nb_rel["left"] + nb_rel["width"], nb_rel["top"] + nb_rel["height"]), (0, 255, 255), 2)
-
+        
         if current_instructions:
             instruction_text = "DO: " + " -> ".join(current_instructions)
             cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
         cv2.imshow(win_name, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        if key == ord('g') and full_grid is not None:
-            print(f"--- grid (@ = falling piece) | falling={falling_shape} next={next_shape} ---")
-            print_grid(full_grid, falling_mask)
 
     capturer.release()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", choices=["camera", "screen"], default=None)
     parser.add_argument("--camera-index", type=int, default=None)
-    parser.add_argument("--debug", action="store_true", help="print detection state a few times per second")
     cli_args = parser.parse_args()
     main(cli_args)
