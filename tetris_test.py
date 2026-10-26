@@ -6,23 +6,42 @@ import time
 import cv2
 import numpy as np
 
-# ==========================================
-# 1. IMPORT YOUR CHAMPION AI ENGINE
-# ==========================================
-from tetris_trainer import find_best_move 
+from tetris_ai_search import find_best_move, BOARD_CACHE
 
-# Update these with your final CSV champion numbers!
+# Clean Right-Well Tetris DNA: Keeps stack flat, never buries holes, and hunts for Tetrises
 CHAMPION_DNA = {
-    'lines_1': -150.0, 
-    'lines_2': -50.0,
-    'lines_3': 10.0,
-    'lines_4': 5000.0,
-    'height': 25.0,
-    'holes': 30.0,
-    'bumpiness': 2.0,
-    'wells': 15.0
+    'lines_1': -40.0,    # Slight preference to save lines for a Tetris, but won't suicide to avoid a clear!
+    'lines_2': 50.0,
+    'lines_3': 200.0,
+    'lines_4': 5000.0,   # Massive Tetris jackpot
+    'height': 65.0,
+    'holes': 900.0,      # Absolute refusal to bury holes
+    'bumpiness': 150.0,  # Keeps columns 0-8 flat as a tabletop
+    'wells': 140.0       # Builds a clean single well in Column 9
 }
-SPAWN_COLUMN = 3
+
+# Clean-Up DNA: Automatically activates whenever there is a hole or the stack reaches Row 13
+CLEANUP_DNA = {
+    'lines_1': 500.0,    # Immediately clear single/double lines to dig down and keep the board clean!
+    'lines_2': 1200.0,
+    'lines_3': 2200.0,
+    'lines_4': 5000.0,
+    'height': 85.0,
+    'holes': 950.0,
+    'bumpiness': 140.0,
+    'wells': 50.0
+}
+
+# Exact NES Tetris leftmost bounding-box column for each piece & rotation (0=0°, 1=90°CW, 2=180°, 3=90°CCW)
+NES_SPAWN_LEFT_COL = {
+    'I': {0: 3, 1: 5, 2: 3, 3: 5},
+    'O': {0: 4, 1: 4, 2: 4, 3: 4},
+    'T': {0: 4, 1: 4, 2: 4, 3: 4},
+    'S': {0: 4, 1: 5, 2: 4, 3: 5},
+    'Z': {0: 4, 1: 5, 2: 4, 3: 5},
+    'J': {0: 4, 1: 4, 2: 4, 3: 4},
+    'L': {0: 4, 1: 4, 2: 4, 3: 4}
+}
 
 try:
     import mss
@@ -34,34 +53,52 @@ CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cal
 BOARD_COLS = 10
 BOARD_ROWS = 20
 
+# Default NES spawn orientations
 PIECE_TEMPLATES = {
-    'I': [np.array([[1, 1, 1, 1]]), np.array([[1], [1], [1], [1]])],
+    'I': [np.array([[1, 1, 1, 1]])],
     'O': [np.array([[1, 1], [1, 1]])],
-    'T': [np.array([[1, 1, 1], [0, 1, 0]]), np.array([[0, 1], [1, 1], [0, 1]]), np.array([[0, 1, 0], [1, 1, 1]]), np.array([[1, 0], [1, 1], [1, 0]])],
-    'S': [np.array([[0, 1, 1], [1, 1, 0]]), np.array([[1, 0], [1, 1], [0, 1]])],
-    'Z': [np.array([[1, 1, 0], [0, 1, 1]]), np.array([[0, 1], [1, 1], [1, 0]])],
-    'J': [np.array([[1, 0, 0], [1, 1, 1]]), np.array([[1, 1], [1, 0], [1, 0]]), np.array([[1, 1, 1], [0, 0, 1]]), np.array([[0, 1], [0, 1], [1, 1]])],
-    'L': [np.array([[0, 0, 1], [1, 1, 1]]), np.array([[1, 0], [1, 0], [1, 1]]), np.array([[1, 1, 1], [1, 0, 0]]), np.array([[1, 1], [0, 1], [0, 1]])]
+    'T': [np.array([[1, 1, 1], [0, 1, 0]])],
+    'S': [np.array([[0, 1, 1], [1, 1, 0]])],
+    'Z': [np.array([[1, 1, 0], [0, 1, 1]])],
+    'J': [np.array([[1, 1, 1], [0, 0, 1]])],
+    'L': [np.array([[1, 1, 1], [1, 0, 0]])]
 }
 
-FUZZY_MATCH_THRESHOLD = 0.75
+FUZZY_MATCH_THRESHOLD = 0.70
 
-# ==========================================
-# 2. ACTION SEQUENCER (FOR HUMAN CONTROL)
-# ==========================================
+
 class ActionSequencer:
-    def get_full_sequence(self, piece_type, best_rot, move_offset):
+    def get_full_sequence(self, piece_type, best_rot, target_left_col):
         if piece_type == 'UNKNOWN':
             return []
         actions = []
-        for _ in range(best_rot):
-            actions.append("ROTATE")
+
+        # 1. Normalize rotation for symmetric pieces (O has 1 state; I, S, Z only need 0 or 1)
+        if piece_type == 'O':
+            best_rot = 0
+        elif piece_type in ('I', 'S', 'Z'):
+            best_rot = best_rot % 2
+
+        # 2. Use ROTATE_CW (A button) and ROTATE_CCW (B button) for speed!
+        if best_rot == 1:
+            actions.append("ROTATE_CW")
+        elif best_rot == 2:
+            actions.append("ROTATE_CW")
+            actions.append("ROTATE_CW")
+        elif best_rot == 3:
+            actions.append("ROTATE_CCW")
+
+        # 3. Calculate exact horizontal shift based on true NES post-rotation column
+        spawn_col = NES_SPAWN_LEFT_COL.get(piece_type, {}).get(best_rot, 4)
+        move_offset = target_left_col - spawn_col
+
         if move_offset < 0:
             for _ in range(abs(move_offset)):
                 actions.append("LEFT")
         elif move_offset > 0:
             for _ in range(move_offset):
                 actions.append("RIGHT")
+
         actions.append("DROP")
         return actions
 
@@ -95,37 +132,90 @@ class CameraCapture:
 
 def load_calibration():
     if not os.path.exists(CALIBRATION_FILE):
-        raise RuntimeError("No calibration found. Run --calibrate first.")
+        raise RuntimeError("No calibration found. Run calibrate.py first.")
     with open(CALIBRATION_FILE) as f:
         return json.load(f)
 
 
+def compute_color_distance_mask(crop):
+    """
+    Your proven Color-Distance detector (catches Level 0 AND Level 1 brown blocks!),
+    enhanced with an anti-bloom cap (150) before blurring so bright 255 white blocks
+    cannot bleed across cell boundaries!
+    """
+    h, w = crop.shape[:2]
+    crop_f = crop.astype(np.float32)
+
+    corner_h = max(4, int(h * 0.18))
+    corner_w = max(4, int(w * 0.22))
+    left_sky = crop_f[:corner_h, :corner_w].reshape(-1, 3)
+    right_sky = crop_f[:corner_h, w - corner_w:].reshape(-1, 3)
+    sky_pixels = np.vstack([left_sky, right_sky])
+
+    bg_color = np.median(sky_pixels, axis=0)
+
+    # 1. Color vector distance from the background
+    color_diff = np.max(np.abs(crop_f - bg_color), axis=2)
+
+    # 2. Red-Minus-Green contrast boost for brown Level 1 blocks against olive-green maze
+    b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
+    bg_b, bg_g, bg_r = bg_color[0], bg_color[1], bg_color[2]
+    rg_shift = np.abs((r - g) - (bg_r - bg_g)) * 0.7
+
+    # Cap max signal at 150 BEFORE blurring so a 255 white block doesn't bloom into neighbor cells!
+    signal = np.clip(np.maximum(color_diff, rg_shift), 0, 150).astype(np.uint8)
+    signal = cv2.GaussianBlur(signal, (3, 3), 0)
+
+    sky_signal_max = float(np.percentile(signal[:corner_h, :corner_w], 92))
+    cutoff = int(np.clip(sky_signal_max + 20, 32, 68))
+    _, thresh = cv2.threshold(signal, cutoff, 255, cv2.THRESH_BINARY)
+    return thresh
+
+
 def scan_binary_grid(crop, cols, rows):
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh = compute_color_distance_mask(crop)
+    
     h, w = crop.shape[:2]
     cell_w = w / cols
     cell_h = h / rows
-    half_w = max(2, int(cell_w * 0.2))
-    half_h = max(2, int(cell_h * 0.2))
+    
+    # 20% inner window: wide enough to never miss a falling piece block, tight enough to avoid neighbors
+    half_w = max(2, int(cell_w * 0.20))
+    half_h = max(2, int(cell_h * 0.20))
     grid = np.zeros((rows, cols), dtype=int)
 
     for r in range(rows):
         for c in range(cols):
             cx, cy = int(c * cell_w + cell_w / 2), int(r * cell_h + cell_h / 2)
             patch = thresh[max(0, cy - half_h):cy + half_h + 1, max(0, cx - half_w):cx + half_w + 1]
-            if patch.size > 0 and (np.count_nonzero(patch) / patch.size) > 0.3:
+            if patch.size > 0 and (np.count_nonzero(patch) / patch.size) >= 0.42:
                 grid[r, c] = 1
     return grid
 
 
-def find_falling_piece_component(grid, search_rows=12):
+def clean_settled_board(settled_grid):
+    """Removes floating mid-air glare while keeping all grounded pieces intact."""
+    cleaned = settled_grid.copy()
+    rows, cols = cleaned.shape
+    cleaned[:4, :] = 0
+
+    num_labels, labels = cv2.connectedComponents(cleaned.astype(np.uint8), connectivity=8)
+    for label in range(1, num_labels):
+        component_mask = (labels == label)
+        touches_floor = np.any(component_mask[rows - 1, :])
+        if not touches_floor:
+            cleaned[component_mask] = 0
+
+    return cleaned
+
+
+def find_falling_piece_component(grid, search_rows=4):
     top = grid[:search_rows].astype(np.uint8)
     num_labels, labels = cv2.connectedComponents(top, connectivity=4)
     best_label, best_size = None, 0
     for label in range(1, num_labels):
         size = int(np.sum(labels == label))
-        if 3 <= size <= 4 and size > best_size:
+        if size == 4 and size > best_size:
             best_size = size
             best_label = label
     if best_label is None:
@@ -155,35 +245,80 @@ def match_shape_matrix(matrix):
     return best_shape if best_score >= FUZZY_MATCH_THRESHOLD else 'UNKNOWN'
 
 
-# MODIFIED: Now returns the full grid and the falling mask alongside the shape!
 def detect_falling_shape(frame, rect):
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
-    crop = frame[y:y + h, x:x + w]
+    # Trim 4px off top and 3px off left/right so the cyan playfield frame never creates a fake dot in Col 9!
+    crop = frame[y + 4:y + h - 1, x + 3:x + w - 3]
     if crop.size == 0:
         return 'UNKNOWN', None, None
 
     grid = scan_binary_grid(crop, BOARD_COLS, BOARD_ROWS)
-    mask = find_falling_piece_component(grid, search_rows=12)
     
-    if mask is None:
-        return 'UNKNOWN', grid, np.zeros_like(grid)
+    SPAWN_ROWS = 4
+    mask_top = find_falling_piece_component(grid, search_rows=SPAWN_ROWS)
+    
+    full_mask = np.zeros_like(grid)
+    if mask_top is None:
+        return 'UNKNOWN', grid, full_mask
 
-    rows_idx, cols_idx = np.where(mask == 1)
+    full_mask[:SPAWN_ROWS, :] = mask_top
+
+    rows_idx, cols_idx = np.where(mask_top == 1)
     min_r, max_r = rows_idx.min(), rows_idx.max()
     min_c, max_c = cols_idx.min(), cols_idx.max()
-    piece_subgrid = mask[min_r:max_r + 1, min_c:max_c + 1]
+    piece_subgrid = mask_top[min_r:max_r + 1, min_c:max_c + 1]
 
     shape = match_shape_matrix(piece_subgrid)
-    return shape, grid, mask
+    return shape, grid, full_mask
 
 
-def detect_next_shape(frame, rect):
+def detect_next_shape(frame, rect, block_size_px):
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
     crop = frame[y:y + h, x:x + w]
-    if crop.size == 0:
+    if crop.size == 0 or block_size_px <= 0:
         return 'UNKNOWN'
-    grid = scan_binary_grid(crop, 4, 4)
-    return match_shape_matrix(grid)
+
+    crop_f = crop.astype(np.float32)
+    top_rim = crop_f[:2, :].reshape(-1, 3)
+    bot_rim = crop_f[-2:, :].reshape(-1, 3)
+    bg_color = np.median(np.vstack([top_rim, bot_rim]), axis=0)
+
+    color_diff = np.max(np.abs(crop_f - bg_color), axis=2)
+    b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
+    rg_shift = np.abs((r - g) - (bg_color[2] - bg_color[1])) * 0.7
+    signal = np.clip(np.maximum(color_diff, rg_shift), 0, 255).astype(np.uint8)
+    signal = cv2.GaussianBlur(signal, (3, 3), 0)
+
+    _, thresh = cv2.threshold(signal, 38, 255, cv2.THRESH_BINARY)
+
+    ys, xs = np.where(thresh > 0)
+    if len(xs) < 10:
+        return 'UNKNOWN'
+
+    min_x, max_x = xs.min(), xs.max()
+    min_y, max_y = ys.min(), ys.max()
+    tight_crop = thresh[min_y:max_y + 1, min_x:max_x + 1]
+    th, tw = tight_crop.shape[:2]
+
+    est_cols = int(np.clip(round(tw / block_size_px), 2, 4))
+    est_rows = int(np.clip(round(th / block_size_px), 1, 2))
+
+    if est_rows == 1 and est_cols == 4:
+        return 'I'
+    if est_rows == 2 and est_cols == 2:
+        return 'O'
+
+    subgrid = np.zeros((2, 3), dtype=int)
+    cell_w = tw / 3.0
+    cell_h = th / 2.0
+    for r in range(2):
+        for c in range(3):
+            patch = tight_crop[int(r * cell_h):int((r + 1) * cell_h),
+                               int(c * cell_w):int((c + 1) * cell_w)]
+            if patch.size > 0 and (np.count_nonzero(patch) / patch.size) > 0.22:
+                subgrid[r, c] = 1
+
+    return match_shape_matrix(subgrid)
 
 
 def main(args):
@@ -210,11 +345,19 @@ def main(args):
     win_name = "AI Champion Controller"
     cv2.namedWindow(win_name)
 
-    last_falling = 'UNKNOWN'
     sequencer = ActionSequencer()
     current_instructions = []
+    
+    candidate_shape = 'UNKNOWN'
+    streak_count = 0
+    empty_frames = 0
+    spawn_locked = False
+    last_valid_next = 'T'
+    best_grid_snapshot = None
 
-    print("\n💜 AI Vision Engine Online! Waiting for pieces...\n")
+    block_size_px = pf_rel["width"] / float(BOARD_COLS)
+
+    print("\nAI Vision Engine Online (Depth-1.5 Beam Search + Color-Distance Vision)! Waiting for pieces...\n")
 
     while True:
         ret, frame = capturer.read()
@@ -222,44 +365,82 @@ def main(args):
             time.sleep(0.001)
             continue
 
-        # 1. Run the new vision detection
         falling_shape, full_grid, falling_mask = detect_falling_shape(frame, pf_rel)
-        next_shape = detect_next_shape(frame, nb_rel)
+        next_shape = detect_next_shape(frame, nb_rel, block_size_px)
+        if next_shape in PIECE_TEMPLATES:
+            last_valid_next = next_shape
 
-        # 2. THE AI TRIGGER: If a valid piece just spawned!
-        if falling_shape in PIECE_TEMPLATES and next_shape in PIECE_TEMPLATES:
-            if falling_shape != last_falling:
-                print(f"👀 Detected Spawn: {falling_shape} (Next: {next_shape})")
-                
-                # Subtract the falling piece to get the pure, settled board!
-                settled_board = np.where(falling_mask == 1, 0, full_grid)
-                
-                # Feed it to your Champion AI
-                best_move, _, _ = find_best_move(settled_board.tolist(), falling_shape, next_shape, CHAMPION_DNA)
-                
-                if best_move:
-                    best_rot, best_col = best_move
-                    move_offset = best_col - SPAWN_COLUMN
-                    
-                    # Sequence the controller inputs
-                    current_instructions = sequencer.get_full_sequence(falling_shape, best_rot, move_offset)
-                    print(f"🔥 AI COMMAND: {' -> '.join(current_instructions)}\n")
-                
-                last_falling = falling_shape
-        elif falling_shape == 'UNKNOWN':
-            # Reset the trigger when the piece drops and disappears
-            last_falling = 'UNKNOWN'
+        raw_settled = np.where(falling_mask == 1, 0, full_grid) if full_grid is not None else None
+        clean_settled = clean_settled_board(raw_settled) if raw_settled is not None else None
 
-        # 3. Draw overlays so you can play along
-        cv2.rectangle(frame, (pf_rel["left"], pf_rel["top"]),
-                      (pf_rel["left"] + pf_rel["width"], pf_rel["top"] + pf_rel["height"]), (0, 255, 0), 2)
+        # STRICT ONE-SHOT SPAWN LOCKOUT FILTER
+        if falling_shape != 'UNKNOWN':
+            empty_frames = 0
+            best_grid_snapshot = clean_settled.copy()
+            if falling_shape == candidate_shape:
+                streak_count += 1
+            else:
+                candidate_shape = falling_shape
+                streak_count = 1
+        else:
+            if full_grid is not None and np.sum(full_grid[:3, :]) == 0:
+                empty_frames += 1
+                if empty_frames >= 3:
+                    spawn_locked = False
+                    streak_count = 0
+                    candidate_shape = 'UNKNOWN'
+
+        # THE AI TRIGGER
+        if not spawn_locked and streak_count >= 2 and candidate_shape in PIECE_TEMPLATES:
+            valid_next = next_shape if next_shape in PIECE_TEMPLATES else last_valid_next
+            
+            # Use CLEANUP_DNA if stack reaches Row 14 or if any buried hole exists so it clears lines immediately!
+            needs_cleanup = np.any(best_grid_snapshot[:14, :] == 1)
+            active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
+            
+            t0 = time.perf_counter()
+            best_move, _, _ = find_best_move(best_grid_snapshot.tolist(), candidate_shape, valid_next, active_dna)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            
+            print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [Compute: {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
+            
+            if best_move:
+                best_rot, best_col = best_move
+                current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
+                print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
+            
+            spawn_locked = True
+
+        # DRAW X-RAY DEBUG OVERLAY
+        eff_left = pf_rel["left"] + 3
+        eff_top = pf_rel["top"] + 4
+        eff_w = pf_rel["width"] - 6
+        eff_h = pf_rel["height"] - 5
+
+        cv2.rectangle(frame, (eff_left, eff_top), (eff_left + eff_w, eff_top + eff_h), (0, 255, 0), 2)
         cv2.rectangle(frame, (nb_rel["left"], nb_rel["top"]),
                       (nb_rel["left"] + nb_rel["width"], nb_rel["top"] + nb_rel["height"]), (0, 255, 255), 2)
-        
-        # Display the AI's real-time instructions on the video feed
+
+        cv2.putText(frame, f"NEXT: {last_valid_next}", (nb_rel["left"], nb_rel["top"] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+        if full_grid is not None and clean_settled is not None:
+            cell_w = eff_w / BOARD_COLS
+            cell_h = eff_h / BOARD_ROWS
+            for r in range(BOARD_ROWS):
+                for c in range(BOARD_COLS):
+                    cx = int(eff_left + c * cell_w + cell_w / 2)
+                    cy = int(eff_top + r * cell_h + cell_h / 2)
+                    if falling_mask[r, c] == 1:
+                        cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)     # RED = Falling Piece
+                    elif clean_settled[r, c] == 1:
+                        cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)     # GREEN = Grounded Settled Block
+                    else:
+                        cv2.circle(frame, (cx, cy), 1, (100, 100, 100), -1) # GRAY = Empty
+
         if current_instructions:
             instruction_text = "DO: " + " -> ".join(current_instructions)
-            cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
         cv2.imshow(win_name, frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):

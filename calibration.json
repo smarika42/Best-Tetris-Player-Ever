@@ -1,16 +1,16 @@
 {
-  "source": "camera",
-  "camera_index": 0,
-  "playfield": {
-    "left": 272,
-    "top": 178,
-    "width": 86,
-    "height": 211
-  },
-  "next_box": {
-    "left": 375,
-    "top": 149,
-    "width": 61,
-    "height": 66
-  }
+    "source": "camera",
+    "camera_index": 0,
+    "playfield": {
+        "left": 290,
+        "top": 136,
+        "width": 107,
+        "height": 216
+    },
+    "next_box": {
+        "left": 421,
+        "top": 117,
+        "width": 60,
+        "height": 41
+    }
 }
