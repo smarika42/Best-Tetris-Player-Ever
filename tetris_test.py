@@ -14,37 +14,44 @@ try:
 except ImportError:
     HAS_PICAMERA2 = False
 
-# Tuned to aggressively build a flat 9-column stack and cash in 4-line Tetrises in Column 9!
+# Tuned to build a flat 9-column stack (Cols 0..8) and cash in 4-line Tetrises in Column 9!
 CHAMPION_DNA = {
-    'lines_1': -180.0,   # Discourage burning single lines when stack is safe
-    'lines_2': -60.0,    # Discourage burning doubles when stack is safe
+    'lines_1': -200.0,   # Discourage burning single lines when stack is low
+    'lines_2': -60.0,    # Discourage burning doubles when stack is low
     'lines_3': 100.0,
-    'lines_4': 8000.0,   # MASSIVE 4-LINE TETRIS PRIORITY!
-    'height': 55.0,
-    'holes': 1100.0,     # Never bury holes
-    'bumpiness': 185.0,  # Keep Columns 0..8 ultra-flat
-    'wells': 260.0       # Guard Column 9 religiously for the 'I' piece
+    'lines_4': 9000.0,   # MASSIVE 4-LINE TETRIS PRIORITY!
+    'height': 60.0,
+    'holes': 1250.0,     # Never bury holes
+    'bumpiness': 200.0,  # Keep Columns 0..8 flat like a table
+    'wells': 280.0       # Keep Column 9 open for the 'I' bar
 }
 
 CLEANUP_DNA = {
-    'lines_1': 650.0,
-    'lines_2': 1400.0,
-    'lines_3': 2600.0,
-    'lines_4': 8000.0,
-    'height': 95.0,
-    'holes': 1050.0,
-    'bumpiness': 160.0,
+    'lines_1': 700.0,
+    'lines_2': 1500.0,
+    'lines_3': 2800.0,
+    'lines_4': 9000.0,
+    'height': 100.0,
+    'holes': 1100.0,
+    'bumpiness': 170.0,
     'wells': 60.0
 }
 
+# VERIFIED FROM VIDEO: In 2-Player SNES Tetris, 3-wide pieces (T, S, Z, J, L) spawn in
+# Columns 4, 5, 6 (4 grey dots to their left: Cols 0, 1, 2, 3)!
+# Pivot center is Column 5:
+# - rot 0 (flat, cols 4,5,6): left col = 4
+# - rot 1 (CW vertical, cols 4,5): left col = 4 (for S/Z/I vertical: cols 5,6 -> left col = 5)
+# - rot 2 (upside down, cols 4,5,6): left col = 4
+# - rot 3 (CCW vertical, cols 5,6): left col = 5
 NES_SPAWN_LEFT_COL = {
     'I': {0: 3, 1: 5, 2: 3, 3: 5},
     'O': {0: 4, 1: 4, 2: 4, 3: 4},
-    'T': {0: 4, 1: 4, 2: 4, 3: 4},
+    'T': {0: 4, 1: 4, 2: 4, 3: 5},
     'S': {0: 4, 1: 5, 2: 4, 3: 5},
     'Z': {0: 4, 1: 5, 2: 4, 3: 5},
-    'J': {0: 4, 1: 4, 2: 4, 3: 4},
-    'L': {0: 4, 1: 4, 2: 4, 3: 4}
+    'J': {0: 4, 1: 4, 2: 4, 3: 5},
+    'L': {0: 4, 1: 4, 2: 4, 3: 5}
 }
 
 try:
@@ -120,12 +127,6 @@ class ScreenCapture:
 
 
 class CameraCapture:
-    """
-    Hybrid Camera Driver:
-    - Automatically uses Picamera2 (libcamera) on Raspberry Pi for the Arducam UC-439 (OV5647).
-    - Settles auto-exposure on the TV monitor and locks AE/AWB so colors never shift mid-game!
-    - Falls back to standard cv2.VideoCapture if run on a laptop/desktop with a USB webcam.
-    """
     def __init__(self, index=0, width=640, height=480):
         self.use_picam = HAS_PICAMERA2
         self.picam2 = None
@@ -137,12 +138,11 @@ class CameraCapture:
                 self.picam2 = Picamera2(camera_num=index)
                 config = self.picam2.create_video_configuration(
                     main={"size": (width, height), "format": "RGB888"},
-                    controls={"FrameDurationLimits": (16666, 33333)}  # 30-60 FPS
+                    controls={"FrameDurationLimits": (16666, 33333)}
                 )
                 self.picam2.configure(config)
                 self.picam2.start()
 
-                # Let auto-exposure and white balance settle on the monitor for 0.8s, then lock them!
                 time.sleep(0.8)
                 self.picam2.set_controls({"AeEnable": False, "AwbEnable": False})
                 print("🔒 OV5647 Exposure & White Balance locked for consistent piece colors!")
@@ -160,7 +160,6 @@ class CameraCapture:
             frame = self.picam2.capture_array()
             if frame is None:
                 return False, None
-            # Picamera2's "RGB888" format outputs BGR byte order directly compatible with OpenCV!
             return True, frame
         return self.cap.read()
 
@@ -215,22 +214,29 @@ def compute_cell_signal_map(crop):
     b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
     bg_b, bg_g, bg_r = bg_ref[0], bg_ref[1], bg_ref[2]
 
-    red_vs_green = np.maximum(0.0, (r - g) - (bg_r - bg_g)) * 1.55
-    blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 1.35
+    # Strong boost for Red, Blue, White, and Lime-Green blocks so settled blocks at the bottom
+    # of the monitor NEVER fade out into grey dots!
+    red_vs_green = np.maximum(0.0, (r - g) - (bg_r - bg_g)) * 1.85
+    red_abs_gain = np.maximum(0.0, (r - bg_r) - np.maximum(0.0, g - bg_g) * 0.45) * 1.65
+    blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 1.65
+    blue_abs_gain = np.maximum(0.0, (b - bg_b) - np.maximum(0.0, g - bg_g) * 0.45) * 1.55
 
-    min_channel_gain = np.maximum(0.0, np.minimum.reduce([b - bg_b, g - bg_g, r - bg_r])) * 1.35
-    rb_mean_gain = np.maximum(0.0, ((r - bg_r) + (b - bg_b)) * 0.5) * 1.25
+    min_channel_gain = np.maximum(0.0, np.minimum.reduce([b - bg_b, g - bg_g, r - bg_r])) * 1.50
+    rb_mean_gain = np.maximum(0.0, ((r - bg_r) + (b - bg_b)) * 0.5) * 1.40
 
     green_gain = np.maximum(0.0, g - bg_g)
     non_green_support = np.maximum(0.0, np.maximum(r - bg_r, b - bg_b))
     lime_green_block = np.where(
-        (green_gain > 38.0) & (non_green_support > 14.0),
-        green_gain * 1.15,
-        np.maximum(0.0, green_gain - 32.0) * 1.10
+        (green_gain > 30.0) & (non_green_support > 10.0),
+        green_gain * 1.30,
+        np.maximum(0.0, green_gain - 25.0) * 1.20
     )
 
     signal = np.clip(
-        np.maximum.reduce([red_vs_green, blue_vs_green, min_channel_gain, rb_mean_gain, lime_green_block]),
+        np.maximum.reduce([
+            red_vs_green, red_abs_gain, blue_vs_green, blue_abs_gain,
+            min_channel_gain, rb_mean_gain, lime_green_block
+        ]),
         0, 220
     ).astype(np.uint8)
 
@@ -238,7 +244,7 @@ def compute_cell_signal_map(crop):
         float(np.percentile(signal[:corner_h, :corner_w], 94)),
         float(np.percentile(signal[:corner_h, w - corner_w:], 94))
     )
-    cutoff = float(np.clip(sky_noise + 14.0, 30.0, 68.0))
+    cutoff = float(np.clip(sky_noise + 12.0, 26.0, 60.0))
     return signal, cutoff
 
 
@@ -249,61 +255,63 @@ def scan_grid_with_strength(crop, cols, rows):
     cell_w = w / float(cols)
     cell_h = h / float(rows)
 
-    half_w = max(1, int(cell_w * 0.26))
-    half_h = max(1, int(cell_h * 0.26))
+    half_w = max(1, int(cell_w * 0.28))
+    half_h = max(1, int(cell_h * 0.28))
 
     grid = np.zeros((rows, cols), dtype=int)
     cell_strength = np.zeros((rows, cols), dtype=np.float32)
 
     for r in range(rows):
+        # Settled blocks on the lower half of the LCD screen appear slightly dimmer to the camera;
+        # use a slightly more sensitive threshold on the lower half so settled blocks NEVER disappear!
+        row_cutoff = cutoff if r < 8 else (cutoff * 0.78)
         for c in range(cols):
             cx = int(c * cell_w + cell_w * 0.5)
             cy = int(r * cell_h + cell_h * 0.5)
             patch = signal[max(0, cy - half_h):min(h, cy + half_h + 1),
                            max(0, cx - half_w):min(w, cx + half_w + 1)]
             if patch.size > 0:
-                val = float(np.percentile(patch, 70))
+                val = float(np.percentile(patch, 72))
                 cell_strength[r, c] = val
-                if val >= cutoff:
+                if val >= row_cutoff:
                     grid[r, c] = 1
 
     return grid, cell_strength, cutoff
 
 
 def clean_settled_board(settled_grid):
+    """
+    Keeps all grounded settled blocks (using 8-connectivity from the bottom floor)
+    so settled blocks above holes stay visible while mid-air falling pieces are ignored!
+    """
     cleaned = settled_grid.copy()
     rows, cols = cleaned.shape
     cleaned[:4, :] = 0
 
-    supported = np.zeros_like(cleaned)
-    supported[rows - 1, :] = cleaned[rows - 1, :]
+    num_labels, labels = cv2.connectedComponents(cleaned.astype(np.uint8), connectivity=8)
+    for label in range(1, num_labels):
+        component_mask = (labels == label)
+        touches_floor = np.any(component_mask[rows - 2:, :])
+        if not touches_floor:
+            cleaned[component_mask] = 0
 
-    for r in range(rows - 2, 3, -1):
-        row_cells = cleaned[r, :]
-        if not np.any(row_cells):
-            continue
-        c = 0
-        while c < cols:
-            if row_cells[c] == 1:
-                c_start = c
-                while c < cols and row_cells[c] == 1:
-                    c += 1
-                c_end = c
-                if np.any(supported[r + 1, c_start:c_end] == 1):
-                    supported[r, c_start:c_end] = 1
-            else:
-                c += 1
-
-    return supported
+    return cleaned
 
 
-def classify_spawn_from_strength(grid, cell_strength, cutoff, search_rows=5):
-    spawn_zone = cell_strength[:search_rows, 2:8].copy()
+def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=5):
+    """
+    Exact Columns 4, 5, 6 Spawn Classifier:
+    - In 2P SNES Tetris, pieces spawn at:
+      * 'I': Columns 3, 4, 5, 6 (indices 1, 2, 3, 4 of `spawn_zone`)
+      * 'O': Columns 4, 5 (indices 2, 3 of `spawn_zone`)
+      * 'T, S, Z, J, L': Columns 4, 5, 6 (indices 2, 3, 4 of `spawn_zone`)!
+    """
+    spawn_zone = cell_strength[:search_rows, 2:8].copy()  # Cols 2, 3, 4, 5, 6, 7
     peak_val = float(np.max(spawn_zone))
-    if peak_val < cutoff * 0.90:
+    if peak_val < cutoff * 0.85:
         return 'UNKNOWN', None
 
-    adaptive_thr = max(cutoff * 0.82, peak_val * 0.52)
+    adaptive_thr = max(cutoff * 0.78, peak_val * 0.48)
     spawn_bin = (spawn_zone >= adaptive_thr).astype(np.uint8)
 
     if int(np.sum(spawn_bin)) < 3:
@@ -316,7 +324,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, search_rows=5):
     for label in range(1, num_labels):
         area = stats[label, cv2.CC_STAT_AREA]
         top_row = stats[label, cv2.CC_STAT_TOP]
-        if 3 <= area <= 8 and top_row <= 2:
+        if 3 <= area <= 9 and top_row <= 2:
             mean_str = float(np.mean(spawn_zone[labels == label]))
             if mean_str > best_score:
                 best_score = mean_str
@@ -328,75 +336,76 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, search_rows=5):
     comp_mask = (labels == best_label)
     rs, cs = np.where(comp_mask)
     min_r, max_r = int(rs.min()), int(rs.max())
-    min_c, max_c = int(cs.min()), int(cs.max())
 
     sh = max_r - min_r + 1
-    sw = max_c - min_c + 1
 
-    if sw >= 4 and sh == 1:
-        full_mask = np.zeros_like(grid)
-        full_mask[min_r, 2 + min_c : 2 + min_c + 4] = 1
-        return 'I', full_mask
+    # 1. Check for flat 4-wide 'I' bar in Columns 3, 4, 5, 6 (indices 1, 2, 3, 4 in spawn_zone)
+    for r_idx in range(min_r, min(search_rows, max_r + 1)):
+        row_4 = spawn_zone[r_idx, 1:5]
+        other_rows_max = 0.0
+        if r_idx + 1 < search_rows:
+            other_rows_max = max(other_rows_max, float(np.max(spawn_zone[r_idx + 1, 1:5])))
+        if r_idx - 1 >= 0:
+            other_rows_max = max(other_rows_max, float(np.max(spawn_zone[r_idx - 1, 1:5])))
 
-    if sh < 2 or sw < 2:
-        return 'UNKNOWN', None
-
-    sub_str = spawn_zone[min_r:min_r + 2, min_c:max_c + 1]
-    if sw >= 4:
-        row_sums = np.sum(sub_str, axis=1)
-        if max(row_sums) > 2.0 * min(row_sums):
-            best_r = min_r + int(np.argmax(row_sums))
+        if float(np.min(row_4)) >= cutoff * 0.72 and float(np.mean(row_4)) > other_rows_max * 1.55:
             full_mask = np.zeros_like(grid)
-            full_mask[best_r, 2 + min_c : 2 + min_c + 4] = 1
+            full_mask[r_idx, 3:7] = 1
             return 'I', full_mask
 
-    if sw == 2:
-        box_2x2 = spawn_zone[min_r:min_r + 2, min_c:min_c + 2]
-        left_flank = float(np.max(spawn_zone[min_r:min_r + 2, min_c - 1])) if min_c > 0 else 0.0
-        right_flank = float(np.max(spawn_zone[min_r:min_r + 2, max_c + 1])) if max_c < 5 else 0.0
+    # Wait until at least 2 rows of the piece have entered the top of the board!
+    if sh < 2 or min_r + 2 > search_rows:
+        return 'UNKNOWN', None
 
-        if float(np.min(box_2x2)) >= peak_val * 0.65 and left_flank < peak_val * 0.38 and right_flank < peak_val * 0.38:
-            full_mask = np.zeros_like(grid)
-            full_mask[min_r:min_r + 2, 2 + min_c : 2 + min_c + 2] = 1
-            return 'O', full_mask
-        if left_flank >= right_flank and min_c > 0:
-            min_c -= 1
-        elif max_c < 5:
-            max_c += 1
-        sw = max_c - min_c + 1
+    # 2. Check for 2x2 'O' piece in Columns 4 & 5 (indices 2 & 3 of `spawn_zone`).
+    # For an 'O' piece, Column 3 (index 1) and Column 6 (index 4) MUST be empty!
+    col3_energy = float(np.max(spawn_zone[min_r:min_r + 2, 1]))
+    col4_5_box = spawn_zone[min_r:min_r + 2, 2:4]
+    col6_energy = float(np.max(spawn_zone[min_r:min_r + 2, 4]))
 
+    if (
+        col4_5_box.shape == (2, 2)
+        and float(np.min(col4_5_box)) >= peak_val * 0.65
+        and col3_energy < peak_val * 0.35
+        and col6_energy < peak_val * 0.35
+    ):
+        full_mask = np.zeros_like(grid)
+        full_mask[min_r:min_r + 2, 4:6] = 1
+        return 'O', full_mask
+
+    # 3. 3-wide pieces (T, S, Z, J, L) spawn in Columns 4, 5, 6 (which is `c0 = 2` in `spawn_zone`!)
     best_3x2_name = 'UNKNOWN'
     best_3x2_score = -999.0
-    best_r0, best_c0 = min_r, min_c
+    best_r0, best_c0 = min_r, 2
 
-    c_start_lim = max(0, min(min_c, 3))
-    c_end_lim = min(3, max_c - 2) if max_c >= 2 else c_start_lim
-
-    for r0 in range(min_r, min(search_rows - 1, max_r + 1)):
-        if r0 + 2 > search_rows:
-            continue
-        for c0 in range(c_start_lim, c_end_lim + 1):
-            win_2x3 = spawn_zone[r0:r0 + 2, c0:c0 + 3]
-            if win_2x3.shape != (2, 3):
+    for r0 in range(max(0, min_r), min(search_rows - 1, max_r + 1)):
+        for c0 in (2, 1):  # `c0 = 2` is Board Columns 4, 5, 6!
+            if r0 + 2 > search_rows or c0 + 3 > 6:
                 continue
-
+            win_2x3 = spawn_zone[r0:r0 + 2, c0:c0 + 3]
             w_min = float(np.min(win_2x3))
             w_max = float(np.max(win_2x3))
             if w_max - w_min < 8.0:
                 continue
             norm_win = (win_2x3 - w_min) / (w_max - w_min)
 
+            # Strong preference for the true SNES spawn columns (Cols 4, 5, 6 -> c0 == 2)
+            col_bias = 0.12 if c0 == 2 else 0.0
+
             for name in ('T', 'S', 'Z', 'J', 'L'):
                 tmpl = PIECE_TEMPLATES[name]
                 ones_mean = float(np.sum(norm_win * tmpl)) / 4.0
                 zeros_mean = float(np.sum(norm_win * (1.0 - tmpl))) / 2.0
-                score = ones_mean - zeros_mean
+                # Strong tie-breaker (+0.18) if it matches the piece we just saw in the Next Box!
+                prior_bonus = 0.18 if (expected_piece == name) else 0.0
+                score = (ones_mean - zeros_mean) + col_bias + prior_bonus
+
                 if score > best_3x2_score:
                     best_3x2_score = score
                     best_3x2_name = name
                     best_r0, best_c0 = r0, c0
 
-    if best_3x2_name != 'UNKNOWN' and best_3x2_score >= 0.16:
+    if best_3x2_name != 'UNKNOWN' and best_3x2_score >= 0.18:
         full_mask = np.zeros_like(grid)
         full_mask[best_r0:best_r0 + 2, 2 + best_c0 : 2 + best_c0 + 3] = PIECE_TEMPLATES[best_3x2_name].astype(int)
         return best_3x2_name, full_mask
@@ -404,7 +413,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, search_rows=5):
     return 'UNKNOWN', None
 
 
-def detect_falling_shape(frame, rect):
+def detect_falling_shape(frame, rect, expected_piece=None):
     trimmed = get_trimmed_playfield_rect(rect)
     x, y, w, h = trimmed["left"], trimmed["top"], trimmed["width"], trimmed["height"]
     crop = frame[y:y + h, x:x + w]
@@ -412,7 +421,9 @@ def detect_falling_shape(frame, rect):
         return 'UNKNOWN', None, None
 
     grid, cell_strength, cutoff = scan_grid_with_strength(crop, BOARD_COLS, BOARD_ROWS)
-    shape, mask_top = classify_spawn_from_strength(grid, cell_strength, cutoff, search_rows=5)
+    shape, mask_top = classify_spawn_from_strength(
+        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=5
+    )
 
     if mask_top is None:
         return 'UNKNOWN', grid, np.zeros_like(grid)
@@ -440,7 +451,7 @@ def detect_next_shape(frame, rect, block_size_px):
     b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
 
     euclidean_dist = np.sqrt(np.sum(diff_bgr * diff_bgr, axis=2)) * 0.65
-    red_boost = np.maximum(0.0, (r - g) - (bg_color[2] - bg_color[1])) * 1.40
+    red_boost = np.maximum(0.0, (r - g) - (bg_color[2] - bg_color[1])) * 1.45
     blue_boost = np.maximum(0.0, (b - g) - (bg_color[0] - bg_color[1])) * 1.25
     green_boost = np.maximum(0.0, g - bg_color[1]) * 0.90
 
@@ -558,6 +569,7 @@ def main(args):
     empty_frames = 0
     spawn_locked = False
     last_valid_next = 'T'
+    expected_spawn_piece = None
     next_vote_buffer = []
     best_grid_snapshot = None
     frame_counter = 0
@@ -565,7 +577,7 @@ def main(args):
     trimmed_pf = get_trimmed_playfield_rect(pf_rel)
     block_size_px = trimmed_pf["width"] / float(BOARD_COLS)
 
-    print("\n🍓 AI Vision Engine Online (Raspberry Pi OV5647 + 4-Line Tetris Well Mode)! Waiting for pieces...\n")
+    print("\n🍓 AI Vision Engine Online (Verified Col-4 Spawn + Adaptive Depth-2 / 1.5)! Waiting for pieces...\n")
 
     while True:
         ret, frame = capturer.read()
@@ -574,7 +586,9 @@ def main(args):
             continue
 
         frame_counter += 1
-        falling_shape, full_grid, falling_mask = detect_falling_shape(frame, pf_rel)
+        falling_shape, full_grid, falling_mask = detect_falling_shape(
+            frame, pf_rel, expected_piece=expected_spawn_piece
+        )
         next_shape, next_debug_mask = detect_next_shape(frame, nb_rel, block_size_px)
 
         if next_shape in PIECE_TEMPLATES:
@@ -598,6 +612,8 @@ def main(args):
             if full_grid is not None and np.sum(full_grid[:3, :]) == 0:
                 empty_frames += 1
                 if empty_frames >= 2:
+                    if spawn_locked:
+                        expected_spawn_piece = last_valid_next
                     spawn_locked = False
                     streak_count = 0
                     candidate_shape = 'UNKNOWN'
@@ -605,15 +621,27 @@ def main(args):
         if not spawn_locked and streak_count >= 2 and candidate_shape in PIECE_TEMPLATES:
             valid_next = last_valid_next
 
-            needs_cleanup = np.any(best_grid_snapshot[:8, :] == 1)
+            # Professor's Rule: Top half clear (rows 0..9 empty) -> Full Depth-2 (beam_width=999)
+            # Any block in top half -> Fast Depth-1.5 Beam Search (beam_width=6)
+            top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
+            active_beam_width = 6 if top_half_occupied else 999
+            depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
+
+            needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
             active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
             mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
 
             t0 = time.perf_counter()
-            best_move, _, _ = find_best_move(best_grid_snapshot.tolist(), candidate_shape, valid_next, active_dna)
+            best_move, _, _ = find_best_move(
+                best_grid_snapshot.tolist(),
+                candidate_shape,
+                valid_next,
+                active_dna,
+                beam_width=active_beam_width
+            )
             dt_ms = (time.perf_counter() - t0) * 1000.0
 
-            print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
+            print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
 
             if best_move:
                 best_rot, best_col = best_move
@@ -622,7 +650,6 @@ def main(args):
 
             spawn_locked = True
 
-        # Over Raspberry Pi Connect screen share, only redraw the GUI every 2nd frame to save Pi 4 CPU!
         if not args.headless and (frame_counter % 2 == 0):
             eff_left = trimmed_pf["left"]
             eff_top = trimmed_pf["top"]
@@ -630,6 +657,9 @@ def main(args):
             eff_h = trimmed_pf["height"]
 
             cv2.rectangle(frame, (eff_left, eff_top), (eff_left + eff_w, eff_top + eff_h), (0, 255, 0), 2)
+            mid_y = int(eff_top + eff_h * 0.5)
+            cv2.line(frame, (eff_left, mid_y), (eff_left + eff_w, mid_y), (255, 200, 0), 1)
+
             cv2.rectangle(frame, (nb_rel["left"], nb_rel["top"]),
                           (nb_rel["left"] + nb_rel["width"], nb_rel["top"] + nb_rel["height"]), (0, 255, 255), 2)
 
