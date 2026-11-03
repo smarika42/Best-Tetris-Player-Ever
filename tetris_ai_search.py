@@ -2,21 +2,20 @@ from tetris_shapes import SHAPES, rotate_piece
 from tetris_brain import evaluate_board
 from tetris_simulator import get_drop_position, place_piece, clear_lines
 
-# Pi-4 Optimized Depth settings:
-# Top half clear -> Depth-2 across all plausible Stage-1 moves (12) in ~45ms!
-# Top half occupied -> Fast Depth-1.5 across top 4 moves in ~15ms!
-DEPTH_2_WIDTH = 12
-DEPTH_1_5_WIDTH = 4
+# Default fallback beam width if none is passed
+DEFAULT_BEAM_WIDTH = 6
 BOARD_CACHE = {}
 
 
 def eval_board_cached(board, weights):
+    """Memoizes the board evaluation score (for 0 lines cleared) so duplicate states aren't recalculated."""
+    # Include id(weights) or a weight key so switching between CHAMPION_DNA and CLEANUP_DNA never mixes cache scores!
     w_key = weights.get('lines_1', 0.0)
     fingerprint = (w_key, tuple(tuple(row) for row in board))
     if fingerprint in BOARD_CACHE:
         return BOARD_CACHE[fingerprint]
 
-    if len(BOARD_CACHE) > 25000:
+    if len(BOARD_CACHE) > 30000:
         BOARD_CACHE.clear()
 
     board_score, _, _, _, _, _ = evaluate_board(board, 0, weights)
@@ -37,6 +36,7 @@ def get_line_reward(lines_scored, weights):
 
 
 def get_unique_rotations(piece_name):
+    """Skips redundant rotations on symmetric pieces (O=1 state, I/S/Z=2 states, T/J/L=4 states)."""
     if piece_name == 'O':
         return (0,)
     elif piece_name in ('I', 'S', 'Z'):
@@ -45,12 +45,20 @@ def get_unique_rotations(piece_name):
 
 
 def find_best_move(board, current_piece_name, next_piece_name, weights, beam_width=None):
+    """
+    Professor's Adaptive Depth Search:
+    - When the top half of the board (rows 0..9) is clear, uses FULL DEPTH-2 SEARCH
+      (evaluates ALL Piece 1 moves x ALL Piece 2 moves) for maximum strategic intelligence!
+    - Once any block reaches the top half of the board (row < 10), switches to fast
+      DEPTH-1.5 BEAM SEARCH (top 6 candidates) for instant high-pressure reaction speed!
+    """
     if current_piece_name not in SHAPES:
         return None, -999999, None
 
+    # Automatically select Depth-2 (all candidates) vs Depth-1.5 (beam_width=6) based on top half of board
     if beam_width is None:
         top_half_occupied = any(1 in row for row in board[:10])
-        beam_width = DEPTH_1_5_WIDTH if top_half_occupied else DEPTH_2_WIDTH
+        beam_width = 6 if top_half_occupied else 999  # 999 = Full Depth-2 Search!
 
     board_cols = len(board[0])
     current_shape = SHAPES[current_piece_name]
@@ -58,6 +66,7 @@ def find_best_move(board, current_piece_name, next_piece_name, weights, beam_wid
 
     stage1_candidates = []
 
+    # --- LEVEL 1: Evaluate all unique moves for the CURRENT piece ---
     for rot1 in range(4):
         if rot1 in valid_rots1:
             piece_w1 = len(current_shape[0])
@@ -89,12 +98,15 @@ def find_best_move(board, current_piece_name, next_piece_name, weights, beam_wid
     if not stage1_candidates:
         return None, -999999, None
 
+    # Sort Level 1 moves from best to worst
     stage1_candidates.sort(key=lambda x: x[0], reverse=True)
 
+    # Fast fallback if beam_width == 0 or next piece is unknown
     if beam_width <= 0 or next_piece_name not in SHAPES:
         best_s1 = stage1_candidates[0]
         return best_s1[2], best_s1[0], best_s1[3]
 
+    # --- LEVEL 2 (Full Depth-2 when beam_width >= len, or Depth-1.5 Beam Search when high!) ---
     top_finalists = stage1_candidates[:beam_width]
     next_shape_original = SHAPES[next_piece_name]
     valid_rots2 = get_unique_rotations(next_piece_name)
@@ -124,6 +136,8 @@ def find_best_move(board, current_piece_name, next_piece_name, weights, beam_wid
                     reward2 = get_line_reward(lines_scored2, weights)
                     total_line_rewards = reward1 + reward2
                     board_score2 = eval_board_cached(simulated_board2, weights)
+                    # Blend 20% of Stage 1 board quality with 80% of Stage 2 outcome so Piece 1
+                    # doesn't make an unnecessarily messy move when multiple Stage 2 outcomes tie!
                     combined_score = (0.20 * stage1_score) + (0.80 * (board_score2 + total_line_rewards))
 
                     if combined_score > best_future_score:
