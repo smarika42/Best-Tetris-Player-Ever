@@ -1,12 +1,13 @@
 import argparse
 import json
 import os
+import threading
 import time
 
 import cv2
 import numpy as np
 
-from tetris_ai_search import find_best_move, BOARD_CACHE
+from tetris_ai_search import find_best_move, BOARD_CACHE, DEPTH_2_WIDTH, DEPTH_1_5_WIDTH
 
 try:
     from picamera2 import Picamera2
@@ -14,16 +15,15 @@ try:
 except ImportError:
     HAS_PICAMERA2 = False
 
-# Tuned to build a flat 9-column stack (Cols 0..8) and cash in 4-line Tetrises in Column 9!
 CHAMPION_DNA = {
-    'lines_1': -200.0,   # Discourage burning single lines when stack is low
-    'lines_2': -60.0,    # Discourage burning doubles when stack is low
+    'lines_1': -200.0,
+    'lines_2': -60.0,
     'lines_3': 100.0,
-    'lines_4': 9000.0,   # MASSIVE 4-LINE TETRIS PRIORITY!
+    'lines_4': 9000.0,
     'height': 60.0,
-    'holes': 1250.0,     # Never bury holes
-    'bumpiness': 200.0,  # Keep Columns 0..8 flat like a table
-    'wells': 280.0       # Keep Column 9 open for the 'I' bar
+    'holes': 1250.0,
+    'bumpiness': 200.0,
+    'wells': 280.0
 }
 
 CLEANUP_DNA = {
@@ -37,13 +37,6 @@ CLEANUP_DNA = {
     'wells': 60.0
 }
 
-# VERIFIED FROM VIDEO: In 2-Player SNES Tetris, 3-wide pieces (T, S, Z, J, L) spawn in
-# Columns 4, 5, 6 (4 grey dots to their left: Cols 0, 1, 2, 3)!
-# Pivot center is Column 5:
-# - rot 0 (flat, cols 4,5,6): left col = 4
-# - rot 1 (CW vertical, cols 4,5): left col = 4 (for S/Z/I vertical: cols 5,6 -> left col = 5)
-# - rot 2 (upside down, cols 4,5,6): left col = 4
-# - rot 3 (CCW vertical, cols 5,6): left col = 5
 NES_SPAWN_LEFT_COL = {
     'I': {0: 3, 1: 5, 2: 3, 3: 5},
     'O': {0: 4, 1: 4, 2: 4, 3: 4},
@@ -63,6 +56,10 @@ CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cal
 
 BOARD_COLS = 10
 BOARD_ROWS = 20
+
+# Arducam OV5647 fisheye barrel correction factor for grid sampling points.
+# Press '[' or ']' in the live window to fine-tune curvature!
+FISHEYE_K = -0.12
 
 PIECE_TEMPLATES = {
     'I': np.array([[1, 1, 1, 1]], dtype=np.float32),
@@ -127,43 +124,71 @@ class ScreenCapture:
 
 
 class CameraCapture:
+    """
+    Zero-Lag Threaded Camera Driver for Arducam OV5647:
+    - Uses buffer_count=2 and a dedicated background reader thread so `read()` ALWAYS
+      returns the most recent millisecond frame and never lags behind the TV monitor!
+    """
     def __init__(self, index=0, width=640, height=480):
         self.use_picam = HAS_PICAMERA2
         self.picam2 = None
         self.cap = None
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = True
 
         if self.use_picam:
             try:
-                print("🍓 Initializing Arducam OV5647 via Picamera2 (640x480)...")
+                print("🍓 Initializing Zero-Lag Arducam OV5647 via Picamera2 (640x480)...")
                 self.picam2 = Picamera2(camera_num=index)
                 config = self.picam2.create_video_configuration(
                     main={"size": (width, height), "format": "RGB888"},
-                    controls={"FrameDurationLimits": (16666, 33333)}
+                    buffer_count=2,
+                    controls={"FrameDurationLimits": (16666, 25000)}  # 40-60 FPS
                 )
                 self.picam2.configure(config)
                 self.picam2.start()
 
-                time.sleep(0.8)
+                time.sleep(0.6)
                 self.picam2.set_controls({"AeEnable": False, "AwbEnable": False})
-                print("🔒 OV5647 Exposure & White Balance locked for consistent piece colors!")
-                return
+                print("🔒 OV5647 Exposure & White Balance locked + Zero-Lag Thread started!")
             except Exception as e:
                 print(f"⚠️ Picamera2 init failed ({e}), falling back to cv2.VideoCapture({index})...")
                 self.use_picam = False
 
-        self.cap = cv2.VideoCapture(index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if not self.use_picam:
+            self.cap = cv2.VideoCapture(index)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        # Start continuous background frame drainer so old frames never pile up!
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _reader_loop(self):
+        while self.running:
+            if self.use_picam and self.picam2 is not None:
+                frame = self.picam2.capture_array()
+                if frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+            elif self.cap is not None:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+            time.sleep(0.002)
 
     def read(self):
-        if self.use_picam and self.picam2 is not None:
-            frame = self.picam2.capture_array()
-            if frame is None:
+        with self.lock:
+            if self.latest_frame is None:
                 return False, None
-            return True, frame
-        return self.cap.read()
+            return True, self.latest_frame.copy()
 
     def release(self):
+        self.running = False
+        self.thread.join(timeout=0.3)
         if self.use_picam and self.picam2 is not None:
             self.picam2.stop()
             self.picam2.close()
@@ -180,7 +205,7 @@ def load_calibration():
 
 def get_trimmed_playfield_rect(rect):
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
-    trim_x = max(1, int(round(w * 0.02)))
+    trim_x = max(1, int(round(w * 0.025)))
     trim_top = max(1, int(round(h * 0.015)))
     trim_bot = max(1, int(round(h * 0.015)))
     return {
@@ -189,6 +214,20 @@ def get_trimmed_playfield_rect(rect):
         "width": max(10, w - 2 * trim_x),
         "height": max(20, h - trim_top - trim_bot)
     }
+
+
+def get_fisheye_cell_center(c, r, cols, rows, w, h):
+    """
+    Maps ideal grid cell (c, r) to the curved fisheye pixel coordinate (cx, cy)
+    on the Arducam OV5647 so top/bottom corner dots don't drift into the walls!
+    """
+    nx = ((c + 0.5) / float(cols) - 0.5) * 2.0  # -1..1
+    ny = ((r + 0.5) / float(rows) - 0.5) * 2.0  # -1..1
+    r2 = nx * nx + ny * ny
+    scale = 1.0 + FISHEYE_K * r2
+    cx = int(round((0.5 + 0.5 * nx * scale) * w))
+    cy = int(round((0.5 + 0.5 * ny * scale) * h))
+    return int(np.clip(cx, 1, w - 2)), int(np.clip(cy, 1, h - 2))
 
 
 def compute_cell_signal_map(crop):
@@ -214,8 +253,6 @@ def compute_cell_signal_map(crop):
     b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
     bg_b, bg_g, bg_r = bg_ref[0], bg_ref[1], bg_ref[2]
 
-    # Strong boost for Red, Blue, White, and Lime-Green blocks so settled blocks at the bottom
-    # of the monitor NEVER fade out into grey dots!
     red_vs_green = np.maximum(0.0, (r - g) - (bg_r - bg_g)) * 1.85
     red_abs_gain = np.maximum(0.0, (r - bg_r) - np.maximum(0.0, g - bg_g) * 0.45) * 1.65
     blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 1.65
@@ -255,19 +292,16 @@ def scan_grid_with_strength(crop, cols, rows):
     cell_w = w / float(cols)
     cell_h = h / float(rows)
 
-    half_w = max(1, int(cell_w * 0.28))
-    half_h = max(1, int(cell_h * 0.28))
+    half_w = max(1, int(cell_w * 0.25))
+    half_h = max(1, int(cell_h * 0.25))
 
     grid = np.zeros((rows, cols), dtype=int)
     cell_strength = np.zeros((rows, cols), dtype=np.float32)
 
     for r in range(rows):
-        # Settled blocks on the lower half of the LCD screen appear slightly dimmer to the camera;
-        # use a slightly more sensitive threshold on the lower half so settled blocks NEVER disappear!
         row_cutoff = cutoff if r < 8 else (cutoff * 0.78)
         for c in range(cols):
-            cx = int(c * cell_w + cell_w * 0.5)
-            cy = int(r * cell_h + cell_h * 0.5)
+            cx, cy = get_fisheye_cell_center(c, r, cols, rows, w, h)
             patch = signal[max(0, cy - half_h):min(h, cy + half_h + 1),
                            max(0, cx - half_w):min(w, cx + half_w + 1)]
             if patch.size > 0:
@@ -280,10 +314,6 @@ def scan_grid_with_strength(crop, cols, rows):
 
 
 def clean_settled_board(settled_grid):
-    """
-    Keeps all grounded settled blocks (using 8-connectivity from the bottom floor)
-    so settled blocks above holes stay visible while mid-air falling pieces are ignored!
-    """
     cleaned = settled_grid.copy()
     rows, cols = cleaned.shape
     cleaned[:4, :] = 0
@@ -298,15 +328,13 @@ def clean_settled_board(settled_grid):
     return cleaned
 
 
-def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=5):
+def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=4):
     """
-    Exact Columns 4, 5, 6 Spawn Classifier:
-    - In 2P SNES Tetris, pieces spawn at:
-      * 'I': Columns 3, 4, 5, 6 (indices 1, 2, 3, 4 of `spawn_zone`)
-      * 'O': Columns 4, 5 (indices 2, 3 of `spawn_zone`)
-      * 'T, S, Z, J, L': Columns 4, 5, 6 (indices 2, 3, 4 of `spawn_zone`)!
+    Fast & Strict Top-of-Board Spawn Classifier (Rows 0..3):
+    - Only looks in Rows 0..3 (`search_rows=4`) so once a piece drops past Row 3,
+      the spawn zone immediately reads empty and resets `spawn_locked` for the next piece!
     """
-    spawn_zone = cell_strength[:search_rows, 2:8].copy()  # Cols 2, 3, 4, 5, 6, 7
+    spawn_zone = cell_strength[:search_rows, 2:8].copy()
     peak_val = float(np.max(spawn_zone))
     if peak_val < cutoff * 0.85:
         return 'UNKNOWN', None
@@ -324,7 +352,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     for label in range(1, num_labels):
         area = stats[label, cv2.CC_STAT_AREA]
         top_row = stats[label, cv2.CC_STAT_TOP]
-        if 3 <= area <= 9 and top_row <= 2:
+        if 3 <= area <= 9 and top_row <= 1:
             mean_str = float(np.mean(spawn_zone[labels == label]))
             if mean_str > best_score:
                 best_score = mean_str
@@ -339,7 +367,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
 
     sh = max_r - min_r + 1
 
-    # 1. Check for flat 4-wide 'I' bar in Columns 3, 4, 5, 6 (indices 1, 2, 3, 4 in spawn_zone)
+    # 1. Flat 4-wide 'I' bar in Columns 3, 4, 5, 6
     for r_idx in range(min_r, min(search_rows, max_r + 1)):
         row_4 = spawn_zone[r_idx, 1:5]
         other_rows_max = 0.0
@@ -353,12 +381,10 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
             full_mask[r_idx, 3:7] = 1
             return 'I', full_mask
 
-    # Wait until at least 2 rows of the piece have entered the top of the board!
     if sh < 2 or min_r + 2 > search_rows:
         return 'UNKNOWN', None
 
-    # 2. Check for 2x2 'O' piece in Columns 4 & 5 (indices 2 & 3 of `spawn_zone`).
-    # For an 'O' piece, Column 3 (index 1) and Column 6 (index 4) MUST be empty!
+    # 2. 2x2 'O' piece in Columns 4 & 5
     col3_energy = float(np.max(spawn_zone[min_r:min_r + 2, 1]))
     col4_5_box = spawn_zone[min_r:min_r + 2, 2:4]
     col6_energy = float(np.max(spawn_zone[min_r:min_r + 2, 4]))
@@ -373,13 +399,13 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
         full_mask[min_r:min_r + 2, 4:6] = 1
         return 'O', full_mask
 
-    # 3. 3-wide pieces (T, S, Z, J, L) spawn in Columns 4, 5, 6 (which is `c0 = 2` in `spawn_zone`!)
+    # 3. 3-wide pieces (T, S, Z, J, L) in Columns 4, 5, 6 (`c0 = 2`)
     best_3x2_name = 'UNKNOWN'
     best_3x2_score = -999.0
     best_r0, best_c0 = min_r, 2
 
     for r0 in range(max(0, min_r), min(search_rows - 1, max_r + 1)):
-        for c0 in (2, 1):  # `c0 = 2` is Board Columns 4, 5, 6!
+        for c0 in (2, 1):
             if r0 + 2 > search_rows or c0 + 3 > 6:
                 continue
             win_2x3 = spawn_zone[r0:r0 + 2, c0:c0 + 3]
@@ -389,14 +415,12 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
                 continue
             norm_win = (win_2x3 - w_min) / (w_max - w_min)
 
-            # Strong preference for the true SNES spawn columns (Cols 4, 5, 6 -> c0 == 2)
             col_bias = 0.12 if c0 == 2 else 0.0
 
             for name in ('T', 'S', 'Z', 'J', 'L'):
                 tmpl = PIECE_TEMPLATES[name]
                 ones_mean = float(np.sum(norm_win * tmpl)) / 4.0
                 zeros_mean = float(np.sum(norm_win * (1.0 - tmpl))) / 2.0
-                # Strong tie-breaker (+0.18) if it matches the piece we just saw in the Next Box!
                 prior_bonus = 0.18 if (expected_piece == name) else 0.0
                 score = (ones_mean - zeros_mean) + col_bias + prior_bonus
 
@@ -422,7 +446,7 @@ def detect_falling_shape(frame, rect, expected_piece=None):
 
     grid, cell_strength, cutoff = scan_grid_with_strength(crop, BOARD_COLS, BOARD_ROWS)
     shape, mask_top = classify_spawn_from_strength(
-        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=5
+        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=4
     )
 
     if mask_top is None:
@@ -537,6 +561,7 @@ def detect_next_shape(frame, rect, block_size_px):
 
 
 def main(args):
+    global FISHEYE_K
     calibration = load_calibration()
     playfield = calibration["playfield"]
     next_box = calibration["next_box"]
@@ -557,7 +582,7 @@ def main(args):
         pf_rel = {"left": playfield["left"] - left, "top": playfield["top"] - top, "width": playfield["width"], "height": playfield["height"]}
         nb_rel = {"left": next_box["left"] - left, "top": next_box["top"] - top, "width": next_box["width"], "height": next_box["height"]}
 
-    win_name = "AI Champion Controller (Pi + OV5647)"
+    win_name = "AI Champion Controller (Zero-Lag + Fisheye Tuned)"
     if not args.headless:
         cv2.namedWindow(win_name)
 
@@ -566,7 +591,6 @@ def main(args):
 
     candidate_shape = 'UNKNOWN'
     streak_count = 0
-    empty_frames = 0
     spawn_locked = False
     last_valid_next = 'T'
     expected_spawn_piece = None
@@ -577,12 +601,13 @@ def main(args):
     trimmed_pf = get_trimmed_playfield_rect(pf_rel)
     block_size_px = trimmed_pf["width"] / float(BOARD_COLS)
 
-    print("\n🍓 AI Vision Engine Online (Verified Col-4 Spawn + Adaptive Depth-2 / 1.5)! Waiting for pieces...\n")
+    print("\n🍓 AI Vision Engine Online (Zero-Lag Threaded Capture + Fisheye Grid)! Waiting for pieces...")
+    print("💡 Tip: Press '[' or ']' in the camera window to adjust fisheye curvature!\n")
 
     while True:
         ret, frame = capturer.read()
         if not ret or frame is None:
-            time.sleep(0.001)
+            time.sleep(0.002)
             continue
 
         frame_counter += 1
@@ -593,7 +618,7 @@ def main(args):
 
         if next_shape in PIECE_TEMPLATES:
             next_vote_buffer.append(next_shape)
-            if len(next_vote_buffer) > 5:
+            if len(next_vote_buffer) > 3:
                 next_vote_buffer.pop(0)
             last_valid_next = max(set(next_vote_buffer), key=next_vote_buffer.count)
 
@@ -601,7 +626,6 @@ def main(args):
         clean_settled = clean_settled_board(raw_settled) if raw_settled is not None else None
 
         if falling_shape != 'UNKNOWN':
-            empty_frames = 0
             best_grid_snapshot = clean_settled.copy()
             if falling_shape == candidate_shape:
                 streak_count += 1
@@ -609,48 +633,48 @@ def main(args):
                 candidate_shape = falling_shape
                 streak_count = 1
         else:
-            if full_grid is not None and np.sum(full_grid[:3, :]) == 0:
-                empty_frames += 1
-                if empty_frames >= 2:
-                    if spawn_locked:
-                        expected_spawn_piece = last_valid_next
-                    spawn_locked = False
-                    streak_count = 0
-                    candidate_shape = 'UNKNOWN'
+            # Instant unlock as soon as the piece leaves the top 3 spawn rows!
+            if full_grid is not None and np.sum(full_grid[:3, 2:8]) == 0:
+                if spawn_locked:
+                    expected_spawn_piece = last_valid_next
+                spawn_locked = False
+                streak_count = 0
+                candidate_shape = 'UNKNOWN'
 
-        if not spawn_locked and streak_count >= 2 and candidate_shape in PIECE_TEMPLATES:
-            valid_next = last_valid_next
+        if not spawn_locked and streak_count >= 1 and candidate_shape in PIECE_TEMPLATES:
+            # Lock on frame 1 if it matches expected_spawn_piece, or frame 2 otherwise!
+            if streak_count >= 2 or candidate_shape == expected_spawn_piece:
+                valid_next = last_valid_next
 
-            # Professor's Rule: Top half clear (rows 0..9 empty) -> Full Depth-2 (beam_width=999)
-            # Any block in top half -> Fast Depth-1.5 Beam Search (beam_width=6)
-            top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
-            active_beam_width = 6 if top_half_occupied else 999
-            depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
+                top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
+                active_beam_width = DEPTH_1_5_WIDTH if top_half_occupied else DEPTH_2_WIDTH
+                depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
 
-            needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
-            active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
-            mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
+                needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
+                active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
+                mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
 
-            t0 = time.perf_counter()
-            best_move, _, _ = find_best_move(
-                best_grid_snapshot.tolist(),
-                candidate_shape,
-                valid_next,
-                active_dna,
-                beam_width=active_beam_width
-            )
-            dt_ms = (time.perf_counter() - t0) * 1000.0
+                t0 = time.perf_counter()
+                best_move, _, _ = find_best_move(
+                    best_grid_snapshot.tolist(),
+                    candidate_shape,
+                    valid_next,
+                    active_dna,
+                    beam_width=active_beam_width
+                )
+                dt_ms = (time.perf_counter() - t0) * 1000.0
 
-            print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
+                print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
 
-            if best_move:
-                best_rot, best_col = best_move
-                current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
-                print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
+                if best_move:
+                    best_rot, best_col = best_move
+                    current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
+                    print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
 
-            spawn_locked = True
+                spawn_locked = True
 
-        if not args.headless and (frame_counter % 2 == 0):
+        # Redraw GUI every 3rd frame so Raspberry Pi Connect / VNC never lags the CPU!
+        if not args.headless and (frame_counter % 3 == 0):
             eff_left = trimmed_pf["left"]
             eff_top = trimmed_pf["top"]
             eff_w = trimmed_pf["width"]
@@ -669,12 +693,10 @@ def main(args):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
             if full_grid is not None and clean_settled is not None:
-                cell_w = eff_w / float(BOARD_COLS)
-                cell_h = eff_h / float(BOARD_ROWS)
                 for r in range(BOARD_ROWS):
                     for c in range(BOARD_COLS):
-                        cx = int(eff_left + c * cell_w + cell_w * 0.5)
-                        cy = int(eff_top + r * cell_h + cell_h * 0.5)
+                        gx, gy = get_fisheye_cell_center(c, r, BOARD_COLS, BOARD_ROWS, eff_w, eff_h)
+                        cx, cy = eff_left + gx, eff_top + gy
                         if falling_mask[r, c] == 1:
                             cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
                         elif clean_settled[r, c] == 1:
@@ -697,8 +719,15 @@ def main(args):
                 cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
             cv2.imshow(win_name, frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('['):
+                FISHEYE_K -= 0.02
+                print(f"🔍 Fisheye curvature adjusted: FISHEYE_K = {FISHEYE_K:.2f}")
+            elif key == ord(']'):
+                FISHEYE_K += 0.02
+                print(f"🔍 Fisheye curvature adjusted: FISHEYE_K = {FISHEYE_K:.2f}")
 
     capturer.release()
     if not args.headless:
