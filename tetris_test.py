@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import threading
 import time
 
 import cv2
@@ -128,43 +129,103 @@ class ScreenCapture:
 
 
 class CameraCapture:
-    def __init__(self, index=0, width=640, height=480):
+    """
+    Zero-Lag Threaded Camera Driver for Arducam IMX708:
+    - Uses full 2304x1296 16:9 sensor mode downscaled to 640x360 so the view is NEVER zoomed/cropped.
+    - Supports continuous autofocus + live manual focus adjustment ('+' / '-' / 'a' keys).
+    - Runs a background frame-draining thread so `read()` always returns the latest millisecond frame.
+    """
+    def __init__(self, index=0, width=640, height=360, saved_lens_pos=None):
         self.use_picam = HAS_PICAMERA2
         self.picam2 = None
         self.cap = None
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.lens_pos = float(saved_lens_pos) if saved_lens_pos is not None else 2.2
 
         if self.use_picam:
             try:
-                print("🍓 Initializing Arducam OV5647 via Picamera2 (640x480)...")
+                print("🍓 Initializing Wide-FOV Arducam IMX708 via Picamera2 (640x360 Full-Sensor)...")
                 self.picam2 = Picamera2(camera_num=index)
                 config = self.picam2.create_video_configuration(
+                    sensor={"output_size": (2304, 1296)},  # Full 16:9 sensor width (no zoom crop!)
                     main={"size": (width, height), "format": "RGB888"},
-                    controls={"FrameDurationLimits": (16666, 33333)}
+                    buffer_count=2,
+                    controls={"FrameDurationLimits": (16666, 25000)}
                 )
                 self.picam2.configure(config)
                 self.picam2.start()
 
-                time.sleep(0.8)
+                if saved_lens_pos is not None:
+                    try:
+                        self.picam2.set_controls({"AfMode": 0, "LensPosition": self.lens_pos})
+                        print(f"🎯 Restored saved manual focus (LensPosition = {self.lens_pos:.2f})")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.picam2.set_controls({"AfMode": 2, "AfSpeed": 1})
+                        print("🔍 Continuous Autofocus active during warmup...")
+                    except Exception:
+                        pass
+                    time.sleep(1.2)
+
                 self.picam2.set_controls({"AeEnable": False, "AwbEnable": False})
-                print("🔒 OV5647 Exposure & White Balance locked for consistent piece colors!")
-                return
+                print("🔒 IMX708 Exposure & White Balance locked + Zero-Lag Thread started!")
             except Exception as e:
                 print(f"⚠️ Picamera2 init failed ({e}), falling back to cv2.VideoCapture({index})...")
                 self.use_picam = False
 
-        self.cap = cv2.VideoCapture(index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if not self.use_picam:
+            self.cap = cv2.VideoCapture(index)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _reader_loop(self):
+        while self.running:
+            if self.use_picam and self.picam2 is not None:
+                frame = self.picam2.capture_array()
+                if frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+            elif self.cap is not None:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+            time.sleep(0.002)
 
     def read(self):
-        if self.use_picam and self.picam2 is not None:
-            frame = self.picam2.capture_array()
-            if frame is None:
+        with self.lock:
+            if self.latest_frame is None:
                 return False, None
-            return True, frame
-        return self.cap.read()
+            return True, self.latest_frame.copy()
+
+    def adjust_focus(self, delta):
+        if self.use_picam and self.picam2 is not None:
+            self.lens_pos = max(0.0, min(10.0, self.lens_pos + delta))
+            try:
+                self.picam2.set_controls({"AfMode": 0, "LensPosition": self.lens_pos})
+                print(f"🎯 Manual Focus set: LensPosition = {self.lens_pos:.2f}")
+            except Exception as e:
+                print(f"⚠️ Focus adjustment error: {e}")
+
+    def trigger_autofocus(self):
+        if self.use_picam and self.picam2 is not None:
+            try:
+                self.picam2.set_controls({"AfMode": 2, "AfSpeed": 1})
+                print("🔍 Switched to Continuous Autofocus!")
+            except Exception:
+                pass
 
     def release(self):
+        self.running = False
+        self.thread.join(timeout=0.3)
         if self.use_picam and self.picam2 is not None:
             self.picam2.stop()
             self.picam2.close()
@@ -263,8 +324,6 @@ def scan_grid_with_strength(crop, cols, rows):
     cell_strength = np.zeros((rows, cols), dtype=np.float32)
 
     for r in range(rows):
-        # Settled blocks on the lower half of the LCD screen appear slightly dimmer to the camera;
-        # use a slightly more sensitive threshold on the lower half so settled blocks NEVER disappear!
         row_cutoff = cutoff if r < 8 else (cutoff * 0.78)
         for c in range(cols):
             cx = int(c * cell_w + cell_w * 0.5)
@@ -299,7 +358,7 @@ def clean_settled_board(settled_grid):
     return cleaned
 
 
-def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=5):
+def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=4):
     """
     Exact Columns 4, 5, 6 Spawn Classifier:
     - In 2P SNES Tetris, pieces spawn at:
@@ -325,7 +384,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     for label in range(1, num_labels):
         area = stats[label, cv2.CC_STAT_AREA]
         top_row = stats[label, cv2.CC_STAT_TOP]
-        if 3 <= area <= 9 and top_row <= 2:
+        if 3 <= area <= 9 and top_row <= 1:
             mean_str = float(np.mean(spawn_zone[labels == label]))
             if mean_str > best_score:
                 best_score = mean_str
@@ -359,7 +418,6 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
         return 'UNKNOWN', None
 
     # 2. Check for 2x2 'O' piece in Columns 4 & 5 (indices 2 & 3 of `spawn_zone`).
-    # For an 'O' piece, Column 3 (index 1) and Column 6 (index 4) MUST be empty!
     col3_energy = float(np.max(spawn_zone[min_r:min_r + 2, 1]))
     col4_5_box = spawn_zone[min_r:min_r + 2, 2:4]
     col6_energy = float(np.max(spawn_zone[min_r:min_r + 2, 4]))
@@ -374,13 +432,13 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
         full_mask[min_r:min_r + 2, 4:6] = 1
         return 'O', full_mask
 
-    # 3. 3-wide pieces (T, S, Z, J, L) spawn in Columns 4, 5, 6 (which is `c0 = 2` in `spawn_zone`!)
+    # 3. 3-wide pieces (T, S, Z, J, L) spawn in Columns 4, 5, 6 (`c0 = 2` in `spawn_zone`!)
     best_3x2_name = 'UNKNOWN'
     best_3x2_score = -999.0
     best_r0, best_c0 = min_r, 2
 
     for r0 in range(max(0, min_r), min(search_rows - 1, max_r + 1)):
-        for c0 in (2, 1):  # `c0 = 2` is Board Columns 4, 5, 6!
+        for c0 in (2, 1):
             if r0 + 2 > search_rows or c0 + 3 > 6:
                 continue
             win_2x3 = spawn_zone[r0:r0 + 2, c0:c0 + 3]
@@ -390,14 +448,12 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
                 continue
             norm_win = (win_2x3 - w_min) / (w_max - w_min)
 
-            # Strong preference for the true SNES spawn columns (Cols 4, 5, 6 -> c0 == 2)
             col_bias = 0.12 if c0 == 2 else 0.0
 
             for name in ('T', 'S', 'Z', 'J', 'L'):
                 tmpl = PIECE_TEMPLATES[name]
                 ones_mean = float(np.sum(norm_win * tmpl)) / 4.0
                 zeros_mean = float(np.sum(norm_win * (1.0 - tmpl))) / 2.0
-                # Strong tie-breaker (+0.18) if it matches the piece we just saw in the Next Box!
                 prior_bonus = 0.18 if (expected_piece == name) else 0.0
                 score = (ones_mean - zeros_mean) + col_bias + prior_bonus
 
@@ -423,7 +479,7 @@ def detect_falling_shape(frame, rect, expected_piece=None):
 
     grid, cell_strength, cutoff = scan_grid_with_strength(crop, BOARD_COLS, BOARD_ROWS)
     shape, mask_top = classify_spawn_from_strength(
-        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=5
+        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=4
     )
 
     if mask_top is None:
@@ -545,7 +601,7 @@ def main(args):
 
     if source == "camera":
         camera_index = args.camera_index if args.camera_index is not None else calibration.get("camera_index", 0) or 0
-        capturer = CameraCapture(camera_index)
+        capturer = CameraCapture(camera_index, saved_lens_pos=calibration.get("lens_position"))
         pf_rel, nb_rel = playfield, next_box
     else:
         left = min(playfield["left"], next_box["left"])
@@ -558,7 +614,7 @@ def main(args):
         pf_rel = {"left": playfield["left"] - left, "top": playfield["top"] - top, "width": playfield["width"], "height": playfield["height"]}
         nb_rel = {"left": next_box["left"] - left, "top": next_box["top"] - top, "width": next_box["width"], "height": next_box["height"]}
 
-    win_name = "AI Champion Controller (Pi + OV5647)"
+    win_name = "AI Champion Controller (Pi + IMX708)"
     if not args.headless:
         cv2.namedWindow(win_name)
 
@@ -568,7 +624,6 @@ def main(args):
 
     candidate_shape = 'UNKNOWN'
     streak_count = 0
-    empty_frames = 0
     spawn_locked = False
     last_valid_next = 'T'
     expected_spawn_piece = None
@@ -579,12 +634,13 @@ def main(args):
     trimmed_pf = get_trimmed_playfield_rect(pf_rel)
     block_size_px = trimmed_pf["width"] / float(BOARD_COLS)
 
-    print("\n🍓 AI Vision Engine Online (Verified Col-4 Spawn + Adaptive Depth-2 / 1.5)! Waiting for pieces...\n")
+    print("\n🍓 AI Vision Engine Online (Arducam IMX708 Wide-FOV + Zero-Lag Thread)! Waiting for pieces...")
+    print("💡 Controls: '+' / '-' = Manual Focus | 'a' = Autofocus | 't' = Test LEDs | 'q' = Quit\n")
 
     while True:
         ret, frame = capturer.read()
         if not ret or frame is None:
-            time.sleep(0.001)
+            time.sleep(0.002)
             continue
 
         frame_counter += 1
@@ -595,7 +651,7 @@ def main(args):
 
         if next_shape in PIECE_TEMPLATES:
             next_vote_buffer.append(next_shape)
-            if len(next_vote_buffer) > 5:
+            if len(next_vote_buffer) > 3:
                 next_vote_buffer.pop(0)
             last_valid_next = max(set(next_vote_buffer), key=next_vote_buffer.count)
 
@@ -603,7 +659,6 @@ def main(args):
         clean_settled = clean_settled_board(raw_settled) if raw_settled is not None else None
 
         if falling_shape != 'UNKNOWN':
-            empty_frames = 0
             best_grid_snapshot = clean_settled.copy()
             if falling_shape == candidate_shape:
                 streak_count += 1
@@ -611,49 +666,49 @@ def main(args):
                 candidate_shape = falling_shape
                 streak_count = 1
         else:
-            if full_grid is not None and np.sum(full_grid[:3, :]) == 0:
-                empty_frames += 1
-                if empty_frames >= 2:
-                    if spawn_locked:
-                        expected_spawn_piece = last_valid_next
-                    spawn_locked = False
-                    streak_count = 0
-                    candidate_shape = 'UNKNOWN'
+            # Unlock immediately as soon as the top 3 spawn rows clear!
+            if full_grid is not None and np.sum(full_grid[:3, 2:8]) == 0:
+                if spawn_locked:
+                    expected_spawn_piece = last_valid_next
+                spawn_locked = False
+                streak_count = 0
+                candidate_shape = 'UNKNOWN'
 
-        if not spawn_locked and streak_count >= 2 and candidate_shape in PIECE_TEMPLATES:
-            valid_next = last_valid_next
+        if not spawn_locked and streak_count >= 1 and candidate_shape in PIECE_TEMPLATES:
+            if streak_count >= 2 or candidate_shape == expected_spawn_piece:
+                valid_next = last_valid_next
 
-            # Professor's Rule: Top half clear (rows 0..9 empty) -> Full Depth-2 (beam_width=999)
-            # Any block in top half -> Fast Depth-1.5 Beam Search (beam_width=6)
-            top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
-            active_beam_width = 6 if top_half_occupied else 999
-            depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
+                # Professor's Rule: Top half clear (rows 0..9 empty) -> Depth-2 (beam_width=12 for ~45ms Pi speed)
+                # Any block in top half -> Fast Depth-1.5 Beam Search (beam_width=4 for ~15ms Pi speed)
+                top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
+                active_beam_width = 4 if top_half_occupied else 12
+                depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
 
-            needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
-            active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
-            mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
+                needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
+                active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
+                mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
 
-            t0 = time.perf_counter()
-            best_move, _, _ = find_best_move(
-                best_grid_snapshot.tolist(),
-                candidate_shape,
-                valid_next,
-                active_dna,
-                beam_width=active_beam_width
-            )
-            dt_ms = (time.perf_counter() - t0) * 1000.0
+                t0 = time.perf_counter()
+                best_move, _, _ = find_best_move(
+                    best_grid_snapshot.tolist(),
+                    candidate_shape,
+                    valid_next,
+                    active_dna,
+                    beam_width=active_beam_width
+                )
+                dt_ms = (time.perf_counter() - t0) * 1000.0
 
-            print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
+                print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
 
-            if best_move:
-                best_rot, best_col = best_move
-                current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
-                print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
-                hw_controller.dispatch_sequence(current_instructions)
+                if best_move:
+                    best_rot, best_col = best_move
+                    current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
+                    print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
+                    hw_controller.dispatch_sequence(current_instructions)
 
-            spawn_locked = True
+                spawn_locked = True
 
-        if not args.headless and (frame_counter % 2 == 0):
+        if not args.headless and (frame_counter % 3 == 0):
             eff_left = trimmed_pf["left"]
             eff_top = trimmed_pf["top"]
             eff_w = trimmed_pf["width"]
@@ -700,17 +755,19 @@ def main(args):
                 cv2.putText(frame, instruction_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
             cv2.imshow(win_name, frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                # Inside the cv2.waitKey(1) check at the bottom of the while loop:
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('t'):
-                    # Press 't' in the camera window to test-fire the LEDs anytime!
-                    demo_seq = ["ROTATE_CW", "LEFT", "LEFT", "DROP"]
-                    print(f"🧪 Manual LED Test Triggered: {' -> '.join(demo_seq)}")
-                    hw_controller.dispatch_sequence(demo_seq)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('t'):
+                demo_seq = ["ROTATE_CW", "LEFT", "LEFT", "DROP"]
+                print(f"🧪 Manual LED Test Triggered: {' -> '.join(demo_seq)}")
+                hw_controller.dispatch_sequence(demo_seq)
+            elif key in (ord('+'), ord('=')) and isinstance(capturer, CameraCapture):
+                capturer.adjust_focus(0.25)
+            elif key == ord('-') and isinstance(capturer, CameraCapture):
+                capturer.adjust_focus(-0.25)
+            elif key == ord('a') and isinstance(capturer, CameraCapture):
+                capturer.trigger_autofocus()
 
     capturer.release()
     hw_controller.cleanup()
