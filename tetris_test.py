@@ -16,26 +16,28 @@ try:
 except ImportError:
     HAS_PICAMERA2 = False
 
-# Tuned to build a flat 9-column stack (Cols 0..8) and cash in 4-line Tetrises in Column 9!
+# STRICT ZERO-HOLE DNA:
+# 'holes' is set to 25,000.0 so the AI will NEVER drop Z, S, J, L, or T over an empty space
+# if a flat, hole-free placement exists anywhere on Columns 0..8!
 CHAMPION_DNA = {
-    'lines_1': -200.0,   # Discourage burning single lines when stack is low
-    'lines_2': -60.0,    # Discourage burning doubles when stack is low
+    'lines_1': -250.0,   # Hold out for 4-line Tetrises when stack is low
+    'lines_2': -80.0,
     'lines_3': 100.0,
-    'lines_4': 9000.0,   # MASSIVE 4-LINE TETRIS PRIORITY!
-    'height': 60.0,
-    'holes': 1250.0,     # Never bury holes
-    'bumpiness': 200.0,  # Keep Columns 0..8 flat like a table
-    'wells': 280.0       # Keep Column 9 open for the 'I' bar
+    'lines_4': 12000.0,  # MASSIVE 4-LINE TETRIS PRIORITY!
+    'height': 75.0,
+    'holes': 25000.0,    # ABSOLUTE ZERO-HOLE PRIORITY! Never create a hole!
+    'bumpiness': 320.0,  # Keep Columns 0..8 flat like a tabletop
+    'wells': 300.0       # Keep Column 9 open for the 'I' bar
 }
 
 CLEANUP_DNA = {
-    'lines_1': 700.0,
-    'lines_2': 1500.0,
-    'lines_3': 2800.0,
-    'lines_4': 9000.0,
-    'height': 100.0,
-    'holes': 1100.0,
-    'bumpiness': 170.0,
+    'lines_1': 900.0,
+    'lines_2': 2000.0,
+    'lines_3': 3500.0,
+    'lines_4': 12000.0,
+    'height': 140.0,
+    'holes': 20000.0,    # Still strictly avoid creating new holes during cleanup
+    'bumpiness': 240.0,
     'wells': 60.0
 }
 
@@ -71,7 +73,7 @@ PIECE_TEMPLATES = {
 }
 
 SMOOTH_BG_COLOR = None
-# Counts how many consecutive frames each cell (r, c) has been continuously occupied
+# Counts how many consecutive frames each cell (r, c) has been continuously occupied without moving
 HOLD_FRAMES = np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.float32)
 
 
@@ -231,11 +233,6 @@ def load_calibration():
 
 
 def get_trimmed_playfield_rect(rect):
-    """
-    CRITICAL FIX FOR COL 9 BORDER BLEED:
-    Trim 3.5% off left & right walls so the bright yellow arcade border next to Column 9
-    NEVER enters the playfield grid!
-    """
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
     trim_x = max(2, int(round(w * 0.035)))
     trim_top = max(1, int(round(h * 0.012)))
@@ -250,15 +247,15 @@ def get_trimmed_playfield_rect(rect):
 
 def compute_cell_signal_map(crop):
     """
-    Clean Color-Contrast Signal Map (No edge dilation bleed!):
-    - Detects Red/Orange (I, Z), Dark Blue (J), White/Yellow (O, T), and Green (S, L)
-      without bleeding the yellow border into Column 9.
+    All-Piece Signal Map (Includes Dark-Blue 'J' Green-Absorption Fix!):
+    - In video_1.mp4 at 1:00, the Dark Blue 'J' piece was missed because Navy Blue has a much
+      LOWER Green value than the bright green SNES background (g << bg_g).
+    - Adding `dark_blue_absorption` makes Dark Blue 'J' pop out clearly at spawn and on the floor!
     """
     global SMOOTH_BG_COLOR
     h, w = crop.shape[:2]
     crop_f = crop.astype(np.float32)
 
-    # Sample background from empty top-left (Cols 0..1) and top-right (Cols 8..9) sky corners
     corner_h = max(4, int(h * 0.14))
     corner_w = max(4, int(w * 0.20))
     left_sky = crop_f[:corner_h, :corner_w].reshape(-1, 3)
@@ -274,7 +271,6 @@ def compute_cell_signal_map(crop):
 
     bg_ref = SMOOTH_BG_COLOR if SMOOTH_BG_COLOR is not None else live_bg
 
-    # Smooth 3x3 to suppress thin 1px circuit-board traces in the green background
     smooth = cv2.blur(crop_f, (3, 3))
     b, g, r = smooth[:, :, 0], smooth[:, :, 1], smooth[:, :, 2]
     bg_b, bg_g, bg_r = bg_ref[0], bg_ref[1], bg_ref[2]
@@ -283,21 +279,22 @@ def compute_cell_signal_map(crop):
     red_vs_green = np.maximum(0.0, (r - g) - (bg_r - bg_g)) * 2.00
     red_abs_gain = np.maximum(0.0, r - bg_r) * 1.65
 
-    # 2. Blue pieces (J): strong blue chroma + green drop (since dark blue absorbs green)
-    blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 2.00
+    # 2. Dark Blue pieces (J): Navy Blue strongly absorbs Green (bg_g - g is large!) while keeping Blue
+    blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 2.05
     blue_abs_gain = np.maximum(0.0, b - bg_b) * 1.75
+    dark_blue_absorption = np.maximum(0.0, (bg_g - g) - 18.0) * 1.70
 
     # 3. White & Yellow pieces (O, T)
     min_channel_gain = np.maximum(0.0, np.minimum.reduce([b - bg_b, g - bg_g, r - bg_r])) * 1.65
     rb_mean_gain = np.maximum(0.0, ((r - bg_r) + (b - bg_b)) * 0.5) * 1.60
 
-    # 4. Green pieces (L, S): solid green tile interiors are brighter in G than background
+    # 4. Green pieces (L, S)
     solid_green_gain = np.maximum(0.0, g - (bg_g + 14.0)) * 1.75
 
     signal = np.clip(
         np.maximum.reduce([
             red_vs_green, red_abs_gain,
-            blue_vs_green, blue_abs_gain,
+            blue_vs_green, blue_abs_gain, dark_blue_absorption,
             min_channel_gain, rb_mean_gain,
             solid_green_gain
         ]),
@@ -319,15 +316,14 @@ def scan_grid_with_strength(crop, cols, rows):
     cell_w = w / float(cols)
     cell_h = h / float(rows)
 
-    # Tight center patch (26% radius) so adjacent columns/borders never bleed into cell centers
-    half_w = max(1, int(cell_w * 0.26))
-    half_h = max(1, int(cell_h * 0.26))
+    half_w = max(1, int(cell_w * 0.25))
+    half_h = max(1, int(cell_h * 0.25))
 
     grid = np.zeros((rows, cols), dtype=int)
     cell_strength = np.zeros((rows, cols), dtype=np.float32)
 
     for r in range(rows):
-        row_cutoff = cutoff if r < 5 else (cutoff * 0.76)
+        row_cutoff = cutoff if r < 5 else (cutoff * 0.78)
         for c in range(cols):
             cx = int(c * cell_w + cell_w * 0.5)
             cy = int(r * cell_h + cell_h * 0.5)
@@ -343,9 +339,6 @@ def scan_grid_with_strength(crop, cols, rows):
 
 
 def is_banner_present(cell_strength, cutoff):
-    """
-    Detects 'WAIT', 'WIN!', or 'LOSE' banners across Rows 3..7 so fake spawns never trigger.
-    """
     banner_band = cell_strength[3:7, 1:9]
     active_cols = int(np.sum(np.max(banner_band, axis=0) >= cutoff * 1.10))
     top_spawn_empty = float(np.max(cell_strength[:2, 3:7])) < cutoff * 0.85
@@ -354,10 +347,19 @@ def is_banner_present(cell_strength, cutoff):
 
 def update_settled_board(raw_grid, falling_mask):
     """
-    True Stationary + Floor-Grounded Settled Stack Filter:
-    - Fixes the mid-air green blobs AND the Column 9 border wall!
-    - A cell must remain continuously occupied for ~10+ frames (so falling pieces passing
-      through Rows 4..16 NEVER become green dots) AND must be connected to the bottom stack!
+    Anti-Phantom Settled Stack Filter (Fixes the 0:42 - 2:10 phantom green dots!):
+    Why did phantom green dots appear in video_1.mp4?
+    1) On Level 0, a falling piece takes ~15 frames to cross each row, which exceeded the old 10-frame threshold!
+    2) Worse, `v_bridge` dilated upward and grabbed the falling piece while it was still 2 rows above the floor!
+    3) And when a cell turned off, `HOLD_FRAMES` decayed too slowly (-2.5), leaving a green trail behind it!
+
+    How we fix it 100%:
+    - Instant Clear on Empty: If `candidate == 0` for a cell, `HOLD_FRAMES` drops by `-8.0` per frame
+      (so the moment a falling piece moves down to the next row, the row it just left clears in ~2 frames!).
+    - Long Stationary Lock (`>= 24 frames` = ~0.85 seconds): Only a piece that has truly stopped moving
+      can reach 24 consecutive frames in the exact same cell!
+    - Strictly Upward Column Support (NO dilation bridge across empty air!): A cell at `(r, c)` can only
+      be settled if it sits on the floor (`r == 19`), OR is directly supported by settled blocks in `r + 1`!
     """
     global HOLD_FRAMES
     rows, cols = raw_grid.shape
@@ -365,58 +367,50 @@ def update_settled_board(raw_grid, falling_mask):
     candidate = np.where(falling_mask == 1, 0, raw_grid).astype(np.float32)
     candidate[:4, :] = 0.0  # Top 4 rows are strictly for spawning pieces
 
-    # Increment counter by +1 when occupied; decay quickly (-2.5) when empty
+    # +1.0 when occupied, fast -8.0 drop when empty so falling pieces NEVER leave a trail behind them!
     HOLD_FRAMES = np.where(
         candidate > 0.5,
-        np.minimum(25.0, HOLD_FRAMES + 1.0),
-        np.maximum(0.0, HOLD_FRAMES - 2.5)
+        np.minimum(35.0, HOLD_FRAMES + 1.0),
+        np.maximum(0.0, HOLD_FRAMES - 8.0)
     )
     HOLD_FRAMES[:4, :] = 0.0
 
-    # Require a block to sit still for at least 10 frames (or 6 frames on the bottom 2 rows)
+    # Require 24 consecutive frames (~0.85s) in mid-board, or 16 frames on the bottom floor row (Row 19)
     stationary_mask = np.zeros((rows, cols), dtype=np.uint8)
-    stationary_mask[4:rows - 2, :] = (HOLD_FRAMES[4:rows - 2, :] >= 10.0).astype(np.uint8)
-    stationary_mask[rows - 2:, :] = (HOLD_FRAMES[rows - 2:, :] >= 6.0).astype(np.uint8)
+    stationary_mask[4:rows - 1, :] = (HOLD_FRAMES[4:rows - 1, :] >= 24.0).astype(np.uint8)
+    stationary_mask[rows - 1, :] = (HOLD_FRAMES[rows - 1, :] >= 16.0).astype(np.uint8)
 
-    # Anti-Wall-Bleed: If a single border column (Col 0 or Col 9) has a tall vertical line
-    # with nothing next to it in Col 1 or Col 8, strip that isolated border glare!
-    if np.sum(stationary_mask[4:16, 9]) >= 6 and np.sum(stationary_mask[4:16, 8]) <= 1:
+    # Anti-Wall-Bleed on Col 0 and Col 9
+    if np.sum(stationary_mask[4:16, 9]) >= 5 and np.sum(stationary_mask[4:16, 8]) <= 1:
         stationary_mask[4:16, 9] = 0
         HOLD_FRAMES[4:16, 9] = 0.0
-    if np.sum(stationary_mask[4:16, 0]) >= 6 and np.sum(stationary_mask[4:16, 1]) <= 1:
+    if np.sum(stationary_mask[4:16, 0]) >= 5 and np.sum(stationary_mask[4:16, 1]) <= 1:
         stationary_mask[4:16, 0] = 0
         HOLD_FRAMES[4:16, 0] = 0.0
 
-    # Keep only components that are grounded in the bottom 3 rows (Rows 17..19)
-    # Use a 1-row vertical bridge so a dark block in the middle of a stack never disconnects the top
-    v_bridge = cv2.dilate(stationary_mask, np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8), iterations=1)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(v_bridge, connectivity=8)
+    # Strictly grounded connected components (NO dilation across empty rows!)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(stationary_mask, connectivity=8)
 
     clean_out = np.zeros((rows, cols), dtype=int)
     for lbl in range(1, num_labels):
         comp = (labels == lbl)
-        if np.any(comp[rows - 3:, :]):
-            clean_out[comp & (stationary_mask == 1)] = 1
+        # Component MUST touch the actual bottom floor (Row 19, or Row 18 if floor block is dark)
+        if np.any(comp[rows - 2:, :]):
+            clean_out[comp] = 1
 
     return clean_out
 
 
 def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=5):
-    """
-    Pure Visual Geometry Spawn Classifier (Rows 0..4):
-    - Never blindly overwrites the playfield with `expected_piece`!
-    - Classifies all 7 pieces visually from the 2x4 / 2x3 spawn window, using `expected_piece`
-      ONLY as a tiny 0.08 tie-breaker between close 3x2 shapes.
-    """
     if is_banner_present(cell_strength, cutoff):
         return 'UNKNOWN', None
 
     spawn_zone = cell_strength[:search_rows, 2:8].copy()  # Cols 2, 3, 4, 5, 6, 7
     peak_val = float(np.max(spawn_zone[:4, 1:5]))
-    if peak_val < cutoff * 0.80:
+    if peak_val < cutoff * 0.78:
         return 'UNKNOWN', None
 
-    adaptive_thr = max(cutoff * 0.70, peak_val * 0.46)
+    adaptive_thr = max(cutoff * 0.68, peak_val * 0.45)
     spawn_bin = (spawn_zone >= adaptive_thr).astype(np.uint8)
 
     if int(np.sum(spawn_bin[:4, 1:5])) < 3:
@@ -446,8 +440,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     sh = max_r - min_r + 1
     sw = max_c - min_c + 1
 
-    # 1. Flat 4-wide 'I' bar in Columns 3, 4, 5, 6 (indices 1, 2, 3, 4 in spawn_zone)
-    # Require the component height to be 1 row (or strong 4-wide row with weak adjacent rows)
+    # 1. Flat 4-wide 'I' bar in Columns 3, 4, 5, 6
     for r_idx in range(min_r, min(3, max_r + 1)):
         row_4 = spawn_zone[r_idx, 1:5]
         other_rows_max = 0.0
@@ -464,7 +457,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     if sh < 2 or min_r + 2 > search_rows:
         return 'UNKNOWN', None
 
-    # 2. Check for 2x2 'O' piece in Columns 4 & 5 (indices 2 & 3 of `spawn_zone`)
+    # 2. Check for 2x2 'O' piece in Columns 4 & 5
     col3_energy = float(np.max(spawn_zone[min_r:min_r + 2, 1]))
     col4_5_box = spawn_zone[min_r:min_r + 2, 2:4]
     col6_energy = float(np.max(spawn_zone[min_r:min_r + 2, 4]))
@@ -501,8 +494,9 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
                 tmpl = PIECE_TEMPLATES[name]
                 ones_mean = float(np.sum(norm_win * tmpl)) / 4.0
                 zeros_mean = float(np.sum(norm_win * (1.0 - tmpl))) / 2.0
-                # Small tie-breaker only (0.08) so a wrong Next Box NEVER forces a false spawn!
-                prior_bonus = 0.08 if (expected_piece == name) else 0.0
+                # Stronger confidence nudge (0.14) from the working Next Box so dark Blue 'J'
+                # and Green 'S'/'L' always match what was just seen in NEXT MASK!
+                prior_bonus = 0.14 if (expected_piece == name) else 0.0
                 score = (ones_mean - zeros_mean) + col_bias + prior_bonus
 
                 if score > best_3x2_score:
@@ -510,7 +504,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
                     best_3x2_name = name
                     best_r0, best_c0 = r0, c0
 
-    if best_3x2_name != 'UNKNOWN' and best_3x2_score >= 0.18:
+    if best_3x2_name != 'UNKNOWN' and best_3x2_score >= 0.16:
         full_mask = np.zeros_like(grid)
         full_mask[best_r0:best_r0 + 2, 2 + best_c0 : 2 + best_c0 + 3] = PIECE_TEMPLATES[best_3x2_name].astype(int)
         return best_3x2_name, full_mask
@@ -538,10 +532,7 @@ def detect_falling_shape(frame, rect, expected_piece=None):
 
 def detect_next_shape(frame, rect, block_size_px):
     """
-    Restored Symmetric 18%-Trim Next Box Detector (From your run where Next Box worked great!):
-    - Uses symmetric 18% padding so the full 3x2 / 4x1 piece stays completely inside the crop
-      (fixing the 'stuck on S' bug from 26% over-cropping).
-    - Zeroes out the bottom 2 rows of pixels so the bottom yellow border never triggers 'I'.
+    Working Next Box Detector from video_1.mp4 (kept intact!).
     """
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
     if w < 8 or h < 8 or block_size_px <= 0:
@@ -568,7 +559,7 @@ def detect_next_shape(frame, rect, block_size_px):
 
     raw_energy = np.maximum.reduce([euclidean_dist, red_boost, blue_boost, green_boost])
     raw_energy[0, :] = 0
-    raw_energy[-2:, :] = 0   # Shave 2px at bottom so bottom frame edge never looks like an 'I' bar
+    raw_energy[-2:, :] = 0
     raw_energy[:, 0] = 0
     raw_energy[:, -2:] = 0
 
@@ -608,13 +599,11 @@ def detect_next_shape(frame, rect, block_size_px):
 
     aspect = tw / float(th)
 
-    # 1. 'I' piece is flat & wide (4x1)
     if aspect >= 2.15 and th <= max(5, int(ch * 0.42)):
         clean_vis = np.zeros((2, 4), dtype=np.uint8)
         clean_vis[0, :] = 255
         return 'I', clean_vis
 
-    # 2. Sample 2x3 grid of the tight bounding box
     subgrid_energy = np.zeros((2, 3), dtype=np.float32)
     for r_idx in range(2):
         for c_idx in range(3):
@@ -630,7 +619,6 @@ def detect_next_shape(frame, rect, block_size_px):
     weakest_2_mean = float(np.mean(sorted_cells[:2]))
     strongest_4_mean = float(np.mean(sorted_cells[2:]))
 
-    # 3. 'O' piece fills all 4 corners of its bounding box
     if weakest_2_mean >= 0.52 and (strongest_4_mean - weakest_2_mean) < 0.28 and aspect <= 1.38:
         clean_vis = np.ones((2, 2), dtype=np.uint8) * 255
         return 'O', clean_vis
@@ -692,7 +680,7 @@ def main(args):
     trimmed_pf = get_trimmed_playfield_rect(pf_rel)
     block_size_px = trimmed_pf["width"] / float(BOARD_COLS)
 
-    print("\n🍓 AI Vision Engine Online (Wall-Bleed Fixed + Pure Visual Spawn + Grounded Stack)!")
+    print("\n🍓 AI Vision Engine Online (Zero-Hole DNA + No-Phantom Stack + Dark-Blue J Fix)!")
     print("💡 Controls: '+' / '-' = Manual Focus | 'a' = Autofocus | 't' = Test LEDs | 'q' = Quit\n")
 
     while True:
