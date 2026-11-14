@@ -232,8 +232,7 @@ def load_calibration():
 
 def get_trimmed_playfield_rect(rect):
     """
-    Do NOT trim the bottom border (`trim_bot = 0`), because in your calibration
-    Row 19 needs to reach all the way to the bottom floor blocks!
+    Trims 1.5% off left/right walls and 1% off top, while keeping bottom floor intact.
     """
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
     trim_x = max(1, int(round(w * 0.015)))
@@ -248,16 +247,18 @@ def get_trimmed_playfield_rect(rect):
 
 def compute_cell_signal_map(crop):
     """
-    IMX708 All-Piece Signal Map:
-    - Specifically fixes the Green 'L' / 'S' detection at spawn (`0:08` in video) and
-      dark Blue 'J' / Red 'I' blocks on the lower half of the board!
+    Demo-Lighting IMX708 All-Piece Signal Map:
+    - Captures dark Blue 'J' (where R and G drop BELOW the green background while B rises),
+      Green 'L'/'S' (via local 3x3 max-min pixel border contrast + green/white highlight),
+      Red 'I'/'Z', and White/Yellow 'O'/'T'.
     """
     global SMOOTH_BG_COLOR
     h, w = crop.shape[:2]
     crop_f = crop.astype(np.float32)
 
-    corner_h = max(4, int(h * 0.14))
-    corner_w = max(4, int(w * 0.25))
+    # Sample top-left & top-right sky corners (Cols 0..1 and Cols 8..9, Rows 0..2)
+    corner_h = max(4, int(h * 0.13))
+    corner_w = max(4, int(w * 0.20))
     left_sky = crop_f[:corner_h, :corner_w].reshape(-1, 3)
     right_sky = crop_f[:corner_h, w - corner_w:].reshape(-1, 3)
     sky_pixels = np.vstack([left_sky, right_sky])
@@ -267,42 +268,53 @@ def compute_cell_signal_map(crop):
         if SMOOTH_BG_COLOR is None:
             SMOOTH_BG_COLOR = live_bg.copy()
         else:
-            SMOOTH_BG_COLOR = 0.90 * SMOOTH_BG_COLOR + 0.10 * live_bg
+            SMOOTH_BG_COLOR = 0.92 * SMOOTH_BG_COLOR + 0.08 * live_bg
 
     bg_ref = SMOOTH_BG_COLOR if SMOOTH_BG_COLOR is not None else live_bg
 
     b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
     bg_b, bg_g, bg_r = bg_ref[0], bg_ref[1], bg_ref[2]
 
-    # 1. Red & Blue pieces (I, Z, J)
-    red_vs_green = np.maximum(0.0, (r - g) - (bg_r - bg_g)) * 1.95
-    red_abs_gain = np.maximum(0.0, r - bg_r) * 1.65
-    blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 1.85
-    blue_abs_gain = np.maximum(0.0, b - bg_b) * 1.65
+    # 1. Red & Orange pieces (I, Z)
+    red_vs_green = np.maximum(0.0, (r - g) - (bg_r - bg_g)) * 2.0
+    red_abs_gain = np.maximum(0.0, r - bg_r) * 1.70
 
-    # 2. White & Yellow pieces (O, T)
-    min_channel_gain = np.maximum(0.0, np.minimum.reduce([b - bg_b, g - bg_g, r - bg_r])) * 1.60
-    rb_mean_gain = np.maximum(0.0, ((r - bg_r) + (b - bg_b)) * 0.5) * 1.50
+    # 2. Dark Blue pieces (J): on the green board, Blue J has MUCH lower Green than bg_g
+    # and higher Blue than bg_b! Using (b - g) - (bg_b - bg_g) + green-drop makes Blue J glow!
+    blue_vs_green = np.maximum(0.0, (b - g) - (bg_b - bg_g)) * 2.10
+    blue_abs_gain = np.maximum(0.0, b - bg_b) * 1.85
+    dark_blue_drop = np.maximum(0.0, (bg_g - g) * 0.85 + (b - bg_b) * 1.15) * 1.55
 
-    # 3. Green pieces (L, S): on the IMX708, Green blocks have solid high G across the whole tile,
-    # whereas background circuit traces are thin 1px lines. Apply a 3x3 median/box filter to G
-    # so solid Green blocks stay bright while thin 1px circuit traces average down into the background!
+    # 3. White & Yellow pieces (O, T)
+    min_channel_gain = np.maximum(0.0, np.minimum.reduce([b - bg_b, g - bg_g, r - bg_r])) * 1.65
+    rb_mean_gain = np.maximum(0.0, ((r - bg_r) + (b - bg_b)) * 0.5) * 1.60
+
+    # 4. Green pieces (L, S): combine smoothed G boost with local 3x3 max-min texture contrast
+    # (Every SNES block has a bright inner specular dot + dark outline, whereas the green bg is flat)
     g_smooth = cv2.blur(g, (3, 3))
-    solid_green_gain = np.maximum(0.0, g_smooth - (bg_g + 16.0)) * 1.65
+    solid_green_gain = np.maximum(0.0, g_smooth - (bg_g + 12.0)) * 1.85
+
+    gray = 0.114 * b + 0.587 * g + 0.299 * r
+    kernel3 = np.ones((3, 3), dtype=np.uint8)
+    local_span = cv2.dilate(gray, kernel3) - cv2.erode(gray, kernel3)
+    bg_span_ref = float(np.percentile(local_span[:corner_h, :corner_w], 85))
+    texture_gain = np.maximum(0.0, local_span - (bg_span_ref + 10.0)) * 1.35
 
     signal = np.clip(
         np.maximum.reduce([
-            red_vs_green, red_abs_gain, blue_vs_green, blue_abs_gain,
-            min_channel_gain, rb_mean_gain, solid_green_gain
+            red_vs_green, red_abs_gain,
+            blue_vs_green, blue_abs_gain, dark_blue_drop,
+            min_channel_gain, rb_mean_gain,
+            solid_green_gain, texture_gain
         ]),
-        0, 220
+        0, 235
     ).astype(np.uint8)
 
     sky_noise = max(
-        float(np.percentile(signal[:corner_h, :corner_w], 92)),
-        float(np.percentile(signal[:corner_h, w - corner_w:], 92))
+        float(np.percentile(signal[:corner_h, :corner_w], 90)),
+        float(np.percentile(signal[:corner_h, w - corner_w:], 90))
     )
-    cutoff = float(np.clip(sky_noise + 11.0, 24.0, 54.0))
+    cutoff = float(np.clip(sky_noise + 10.0, 22.0, 50.0))
     return signal, cutoff
 
 
@@ -313,22 +325,21 @@ def scan_grid_with_strength(crop, cols, rows):
     cell_w = w / float(cols)
     cell_h = h / float(rows)
 
-    half_w = max(1, int(cell_w * 0.30))
-    half_h = max(1, int(cell_h * 0.30))
+    half_w = max(1, int(cell_w * 0.32))
+    half_h = max(1, int(cell_h * 0.32))
 
     grid = np.zeros((rows, cols), dtype=int)
     cell_strength = np.zeros((rows, cols), dtype=np.float32)
 
     for r in range(rows):
-        # More sensitive cutoff in the lower rows (r >= 6) so settled blocks NEVER turn grey!
-        row_cutoff = cutoff if r < 6 else (cutoff * 0.72)
+        row_cutoff = cutoff if r < 5 else (cutoff * 0.74)
         for c in range(cols):
             cx = int(c * cell_w + cell_w * 0.5)
             cy = int(r * cell_h + cell_h * 0.5)
             patch = signal[max(0, cy - half_h):min(h, cy + half_h + 1),
                            max(0, cx - half_w):min(w, cx + half_w + 1)]
             if patch.size > 0:
-                val = float(np.percentile(patch, 70))
+                val = float(np.percentile(patch, 72))
                 cell_strength[r, c] = val
                 if val >= row_cutoff:
                     grid[r, c] = 1
@@ -336,57 +347,77 @@ def scan_grid_with_strength(crop, cols, rows):
     return grid, cell_strength, cutoff
 
 
-def clean_settled_board(settled_grid):
+def is_banner_present(grid, cell_strength, cutoff):
     """
-    Stack-Safe Settled Board Filter (Fixes the 0:46 vanishing stack bug!):
-    - Previously, if Row 18/19 missed a single dot at the very bottom border, `touches_floor`
-      returned False and deleted the ENTIRE stack!
-    - Now we use temporal persistence (SETTLED_PERSISTENCE) and keep any grounded component
-      in the lower board (`rows - 4:`) OR any connected stack of >= 3 blocks below Row 5!
+    Detects arcade overlay banners ('WAIT', 'WIN!', 'LOSE') in Rows 3..7 so the AI
+    never triggers fake spawns before the game starts or after it ends.
+    """
+    banner_band = cell_strength[3:7, 1:9]
+    active_cols = np.sum(np.max(banner_band, axis=0) >= cutoff * 1.10)
+    top_spawn_empty = np.max(cell_strength[:2, 3:7]) < cutoff * 0.85
+    # "WAIT" spans 6+ columns horizontally across Rows 4..5 while Rows 0..1 are empty
+    if active_cols >= 6 and top_spawn_empty:
+        return True
+    return False
+
+
+def clean_settled_board(settled_grid, piece_in_flight=False):
+    """
+    Gravity-Grounded Settled Stack Filter:
+    - Eliminates the 'green trail' bug where falling pieces in Rows 4..15 were added to the settled stack!
+    - Only blocks connected to the bottom floor (Rows 18..19) via 8-connected components
+      (with a 1-cell vertical bridge tolerance) are accepted as settled stack blocks.
     """
     global SETTLED_PERSISTENCE
     rows, cols = settled_grid.shape
     raw = settled_grid.astype(np.float32).copy()
     raw[:4, :] = 0.0
 
-    # Fast rise (0.60) when a block lands, slow decay (0.82) so a momentary dim frame never erases the stack!
+    # First, find which raw cells are physically supported from the bottom floor (Rows 18..19)
+    raw_u8 = (raw > 0.5).astype(np.uint8)
+    # Dilate vertically by 1 row only to bridge tiny mortar gaps, then check floor contact
+    v_kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+    bridged = cv2.dilate(raw_u8, v_kernel, iterations=1)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bridged, connectivity=8)
+
+    grounded_raw = np.zeros_like(raw)
+    for lbl in range(1, num_labels):
+        comp = (labels == lbl)
+        # Must touch the bottom 2 rows (Rows 18 or 19) to be a real grounded stack!
+        if np.any(comp[rows - 2:, :]):
+            grounded_raw[comp & (raw_u8 == 1)] = 1.0
+
+    # Update temporal persistence ONLY with grounded blocks so falling mid-air pieces NEVER leave trails!
+    rise_rate = 0.35 if piece_in_flight else 0.65
     SETTLED_PERSISTENCE = np.where(
-        raw > 0.5,
-        np.maximum(SETTLED_PERSISTENCE, 0.60 * SETTLED_PERSISTENCE + 0.40 * raw),
-        0.82 * SETTLED_PERSISTENCE
+        grounded_raw > 0.5,
+        np.maximum(SETTLED_PERSISTENCE, (1.0 - rise_rate) * SETTLED_PERSISTENCE + rise_rate * grounded_raw),
+        0.78 * SETTLED_PERSISTENCE
     )
     SETTLED_PERSISTENCE[:4, :] = 0.0
 
-    cleaned = (SETTLED_PERSISTENCE >= 0.35).astype(np.uint8)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
-    out = np.zeros_like(settled_grid)
-    for label in range(1, num_labels):
-        component_mask = (labels == label)
-        area = stats[label, cv2.CC_STAT_AREA]
-        touches_bottom_zone = np.any(component_mask[rows - 4:, :])
-        # Keep any stack touching the bottom 4 rows, OR any real cluster (>= 3 blocks) in rows 6..19
-        if touches_bottom_zone or (area >= 3 and np.any(component_mask[6:, :])):
-            out[component_mask] = 1
-
-    return out
+    cleaned = (SETTLED_PERSISTENCE >= 0.42).astype(int)
+    return cleaned
 
 
-def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=5):
+def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=None, search_rows=4):
     """
-    Immediate Top-of-Board Spawn Classifier:
-    - Searches Rows 0..4 (`search_rows=5`) and `top_row <= 2` so even if a piece isn't caught
-      until Row 1 or 2, it is still immediately classified and locked!
+    Precision Top-of-Board Spawn Classifier (Rows 0..3):
+    - Classifies newly spawned pieces cleanly in Columns 3..6 without getting fooled by
+      Wait banners or high stacks.
     """
-    spawn_zone = cell_strength[:search_rows, 2:8].copy()  # Cols 2, 3, 4, 5, 6, 7
-    peak_val = float(np.max(spawn_zone))
-    if peak_val < cutoff * 0.80:
+    if is_banner_present(grid, cell_strength, cutoff):
         return 'UNKNOWN', None
 
-    adaptive_thr = max(cutoff * 0.72, peak_val * 0.45)
+    spawn_zone = cell_strength[:search_rows, 2:8].copy()  # Cols 2, 3, 4, 5, 6, 7
+    peak_val = float(np.max(spawn_zone[:3, 1:5]))
+    if peak_val < cutoff * 0.82:
+        return 'UNKNOWN', None
+
+    adaptive_thr = max(cutoff * 0.72, peak_val * 0.46)
     spawn_bin = (spawn_zone >= adaptive_thr).astype(np.uint8)
 
-    if int(np.sum(spawn_bin)) < 3:
+    if int(np.sum(spawn_bin[:3, :])) < 3:
         return 'UNKNOWN', None
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(spawn_bin, connectivity=8)
@@ -396,7 +427,8 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     for label in range(1, num_labels):
         area = stats[label, cv2.CC_STAT_AREA]
         top_row = stats[label, cv2.CC_STAT_TOP]
-        if 3 <= area <= 9 and top_row <= 2:
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        if 3 <= area <= 8 and top_row <= 1 and width <= 5:
             mean_str = float(np.mean(spawn_zone[labels == label]))
             if mean_str > best_score:
                 best_score = mean_str
@@ -411,7 +443,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     sh = max_r - min_r + 1
 
     # 1. Check for flat 4-wide 'I' bar in Columns 3, 4, 5, 6 (indices 1, 2, 3, 4 in spawn_zone)
-    for r_idx in range(min_r, min(search_rows, max_r + 1)):
+    for r_idx in range(min_r, min(3, max_r + 1)):
         row_4 = spawn_zone[r_idx, 1:5]
         other_rows_max = 0.0
         if r_idx + 1 < search_rows:
@@ -419,7 +451,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
         if r_idx - 1 >= 0:
             other_rows_max = max(other_rows_max, float(np.max(spawn_zone[r_idx - 1, 1:5])))
 
-        if float(np.min(row_4)) >= cutoff * 0.68 and float(np.mean(row_4)) > other_rows_max * 1.45:
+        if float(np.min(row_4)) >= cutoff * 0.70 and float(np.mean(row_4)) > other_rows_max * 1.45:
             full_mask = np.zeros_like(grid)
             full_mask[r_idx, 3:7] = 1
             return 'I', full_mask
@@ -427,7 +459,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     if sh < 2 or min_r + 2 > search_rows:
         return 'UNKNOWN', None
 
-    # 2. Check for 2x2 'O' piece in Columns 4 & 5 (indices 2 & 3 of `spawn_zone`).
+    # 2. Check for 2x2 'O' piece in Columns 4 & 5 (indices 2 & 3 of `spawn_zone`)
     col3_energy = float(np.max(spawn_zone[min_r:min_r + 2, 1]))
     col4_5_box = spawn_zone[min_r:min_r + 2, 2:4]
     col6_energy = float(np.max(spawn_zone[min_r:min_r + 2, 4]))
@@ -435,14 +467,14 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
     if (
         col4_5_box.shape == (2, 2)
         and float(np.min(col4_5_box)) >= peak_val * 0.62
-        and col3_energy < peak_val * 0.35
-        and col6_energy < peak_val * 0.35
+        and col3_energy < peak_val * 0.38
+        and col6_energy < peak_val * 0.38
     ):
         full_mask = np.zeros_like(grid)
         full_mask[min_r:min_r + 2, 4:6] = 1
         return 'O', full_mask
 
-    # 3. 3-wide pieces (T, S, Z, J, L) spawn in Columns 4, 5, 6 (`c0 = 2` in `spawn_zone`!)
+    # 3. 3-wide pieces (T, S, Z, J, L) spawn in Columns 4, 5, 6 (`c0 = 2` in `spawn_zone`)
     best_3x2_name = 'UNKNOWN'
     best_3x2_score = -999.0
     best_r0, best_c0 = min_r, 2
@@ -454,17 +486,18 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
             win_2x3 = spawn_zone[r0:r0 + 2, c0:c0 + 3]
             w_min = float(np.min(win_2x3))
             w_max = float(np.max(win_2x3))
-            if w_max - w_min < 6.0:
+            if w_max - w_min < 7.0:
                 continue
             norm_win = (win_2x3 - w_min) / (w_max - w_min)
 
-            col_bias = 0.14 if c0 == 2 else 0.0
+            col_bias = 0.16 if c0 == 2 else 0.0
 
             for name in ('T', 'S', 'Z', 'J', 'L'):
                 tmpl = PIECE_TEMPLATES[name]
                 ones_mean = float(np.sum(norm_win * tmpl)) / 4.0
                 zeros_mean = float(np.sum(norm_win * (1.0 - tmpl))) / 2.0
-                prior_bonus = 0.16 if (expected_piece == name) else 0.0
+                # Tiny tie-breaker bonus only if Next Box was confident
+                prior_bonus = 0.06 if (expected_piece == name) else 0.0
                 score = (ones_mean - zeros_mean) + col_bias + prior_bonus
 
                 if score > best_3x2_score:
@@ -472,7 +505,7 @@ def classify_spawn_from_strength(grid, cell_strength, cutoff, expected_piece=Non
                     best_3x2_name = name
                     best_r0, best_c0 = r0, c0
 
-    if best_3x2_name != 'UNKNOWN' and best_3x2_score >= 0.15:
+    if best_3x2_name != 'UNKNOWN' and best_3x2_score >= 0.22:
         full_mask = np.zeros_like(grid)
         full_mask[best_r0:best_r0 + 2, 2 + best_c0 : 2 + best_c0 + 3] = PIECE_TEMPLATES[best_3x2_name].astype(int)
         return best_3x2_name, full_mask
@@ -489,7 +522,7 @@ def detect_falling_shape(frame, rect, expected_piece=None):
 
     grid, cell_strength, cutoff = scan_grid_with_strength(crop, BOARD_COLS, BOARD_ROWS)
     shape, mask_top = classify_spawn_from_strength(
-        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=5
+        grid, cell_strength, cutoff, expected_piece=expected_piece, search_rows=4
     )
 
     if mask_top is None:
@@ -500,61 +533,85 @@ def detect_falling_shape(frame, rect, expected_piece=None):
 
 def detect_next_shape(frame, rect, block_size_px):
     """
-    Border-Proof Next Box Detector for IMX708:
-    - Trims 18% off the edges of the yellow Next Box so the bright white arcade frame on the
-      bottom/right edge NEVER enters the crop or ruins normalization!
+    Border-Immune Next Box Detector (Fixes the permanent 'NEXT: I' bug in video_1.mp4!):
+    - In video_1.mp4, the bottom/right white-yellow border of the Next Box entered the crop
+      and created a wide horizontal bar at the bottom, locking `NEXT: I` for the entire game!
+    - Now we:
+      1) Crop asymmetrically toward the dark interior center of the Next Box.
+      2) Reference the dark teal/black background from the top-left interior quadrant.
+      3) Reject any component touching the bottom/right border or off-center perimeter.
+      4) Classify using 2x4 / 2x3 cell correlation + aspect ratio.
     """
     x, y, w, h = rect["left"], rect["top"], rect["width"], rect["height"]
-    if w < 8 or h < 8 or block_size_px <= 0:
+    if w < 10 or h < 10 or block_size_px <= 0:
         return 'UNKNOWN', None
 
-    # Shave 18% off all 4 sides to completely eliminate the white arcade bevel seen in the video!
-    pad_x = max(3, int(round(w * 0.18)))
-    pad_y = max(3, int(round(h * 0.18)))
-    crop = frame[y + pad_y : y + h - pad_y, x + pad_x : x + w - pad_x]
-    if crop.size == 0:
+    # Shave 20% off left/top and 26% off right/bottom where the bright yellow-white bevel sits!
+    pad_l = max(3, int(round(w * 0.20)))
+    pad_r = max(4, int(round(w * 0.26)))
+    pad_t = max(3, int(round(h * 0.20)))
+    pad_b = max(4, int(round(h * 0.26)))
+
+    crop = frame[y + pad_t : y + h - pad_b, x + pad_l : x + w - pad_r]
+    if crop.size == 0 or crop.shape[0] < 6 or crop.shape[1] < 8:
         return 'UNKNOWN', None
 
     crop_f = crop.astype(np.float32)
     ch, cw = crop.shape[:2]
 
-    bg_color = np.percentile(crop_f.reshape(-1, 3), 15, axis=0)
-
-    diff_bgr = np.maximum(0.0, crop_f - bg_color)
+    # Sample dark background from the darkest 25% of pixels in the interior
+    bg_color = np.percentile(crop_f.reshape(-1, 3), 20, axis=0)
     b, g, r = crop_f[:, :, 0], crop_f[:, :, 1], crop_f[:, :, 2]
 
-    euclidean_dist = np.sqrt(np.sum(diff_bgr * diff_bgr, axis=2)) * 0.80
-    red_boost = np.maximum(0.0, r - bg_color[2]) * 1.65
-    blue_boost = np.maximum(0.0, b - bg_color[0]) * 1.55
-    green_boost = np.maximum(0.0, g - bg_color[1]) * 1.35
+    diff_b = np.abs(b - bg_color[0])
+    diff_g = np.abs(g - bg_color[1])
+    diff_r = np.abs(r - bg_color[2])
 
-    raw_energy = np.maximum.reduce([euclidean_dist, red_boost, blue_boost, green_boost])
-    raw_energy[0, :] = 0
-    raw_energy[-1, :] = 0
-    raw_energy[:, 0] = 0
-    raw_energy[:, -1] = 0
+    # Combine color distance + local 3x3 contrast so dark Blue J, Green L/S, and Red I/Z all pop!
+    color_energy = np.maximum.reduce([
+        diff_r * 1.65,
+        diff_b * 1.65,
+        diff_g * 1.45,
+        np.sqrt(diff_b**2 + diff_g**2 + diff_r**2) * 0.85
+    ])
 
-    e_max = float(np.percentile(raw_energy, 96))
-    e_min = float(np.percentile(raw_energy, 15))
-    if e_max - e_min < 18.0:
+    # Zero out a 2-pixel safety moat around all 4 edges so frame borders can NEVER connect!
+    color_energy[:2, :] = 0
+    color_energy[-2:, :] = 0
+    color_energy[:, :2] = 0
+    color_energy[:, -2:] = 0
+
+    e_max = float(np.percentile(color_energy, 96))
+    e_min = float(np.percentile(color_energy, 15))
+    if e_max - e_min < 16.0:
         return 'UNKNOWN', np.zeros((ch, cw), dtype=np.uint8)
 
-    norm_energy = np.clip((raw_energy - e_min) / (e_max - e_min), 0.0, 1.0)
+    norm_energy = np.clip((color_energy - e_min) / (e_max - e_min), 0.0, 1.0)
     signal_u8 = (norm_energy * 255.0).astype(np.uint8)
 
-    # Lower threshold (105 instead of 140) so dark Blue 'J' and Red 'I' pieces stay solid!
-    _, bbox_thresh = cv2.threshold(signal_u8, 105, 255, cv2.THRESH_BINARY)
+    _, bbox_thresh = cv2.threshold(signal_u8, 100, 255, cv2.THRESH_BINARY)
 
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bbox_thresh, connectivity=8)
     best_label = None
-    best_area = 0
+    best_score = -1.0
+
     for lbl in range(1, num_labels):
         area = stats[lbl, cv2.CC_STAT_AREA]
+        comp_top = stats[lbl, cv2.CC_STAT_TOP]
+        comp_h = stats[lbl, cv2.CC_STAT_HEIGHT]
         cx, cy = centroids[lbl]
-        if area >= 5 and (0.08 * cw <= cx <= 0.92 * cw) and (0.08 * ch <= cy <= 0.92 * ch):
-            if area > best_area:
-                best_area = area
-                best_label = lbl
+
+        # Reject tiny noise or anything stuck at the very bottom/top edge of the box
+        if area < 6:
+            continue
+        if not (0.15 * cw <= cx <= 0.85 * cw and 0.15 * ch <= cy <= 0.82 * ch):
+            continue
+        # Score by area weighted by how close the blob is to the true center of the Next Box
+        center_dist = np.hypot((cx - cw * 0.5) / cw, (cy - ch * 0.5) / ch)
+        score = area * (1.0 - center_dist)
+        if score > best_score:
+            best_score = score
+            best_label = lbl
 
     if best_label is None:
         return 'UNKNOWN', bbox_thresh
@@ -571,8 +628,8 @@ def detect_next_shape(frame, rect, block_size_px):
 
     aspect = tw / float(th)
 
-    # 1. 'I' piece is flat & wide (4x1)
-    if aspect >= 2.05:
+    # 1. 'I' piece is flat & wide (4x1) AND sits near the vertical middle of the box (not a bottom border)
+    if aspect >= 2.25 and th <= max(4, int(ch * 0.38)):
         clean_vis = np.zeros((2, 4), dtype=np.uint8)
         clean_vis[0, :] = 255
         return 'I', clean_vis
@@ -581,23 +638,24 @@ def detect_next_shape(frame, rect, block_size_px):
     subgrid_energy = np.zeros((2, 3), dtype=np.float32)
     for r_idx in range(2):
         for c_idx in range(3):
-            y0 = int(round((r_idx + 0.15) * th / 2.0))
-            y1 = max(y0 + 1, int(round((r_idx + 0.85) * th / 2.0)))
-            x0 = int(round((c_idx + 0.15) * tw / 3.0))
-            x1 = max(x0 + 1, int(round((c_idx + 0.85) * tw / 3.0)))
+            y0 = int(round((r_idx + 0.12) * th / 2.0))
+            y1 = max(y0 + 1, int(round((r_idx + 0.88) * th / 2.0)))
+            x0 = int(round((c_idx + 0.12) * tw / 3.0))
+            x1 = max(x0 + 1, int(round((c_idx + 0.88) * tw / 3.0)))
             patch = tight_energy[y0:y1, x0:x1]
             if patch.size > 0:
-                subgrid_energy[r_idx, c_idx] = float(np.percentile(patch, 65))
+                subgrid_energy[r_idx, c_idx] = float(np.percentile(patch, 68))
 
     sorted_cells = np.sort(subgrid_energy.flatten())
     weakest_2_mean = float(np.mean(sorted_cells[:2]))
     strongest_4_mean = float(np.mean(sorted_cells[2:]))
 
-    # 3. 'O' piece fills all 4 corners of its bounding box
-    if weakest_2_mean >= 0.52 and (strongest_4_mean - weakest_2_mean) < 0.28 and aspect <= 1.38:
+    # 3. 'O' piece fills all 4 corners of its bounding box with compact aspect ratio
+    if weakest_2_mean >= 0.54 and (strongest_4_mean - weakest_2_mean) < 0.26 and aspect <= 1.42:
         clean_vis = np.ones((2, 2), dtype=np.uint8) * 255
         return 'O', clean_vis
 
+    # 4. Compare against 3x2 templates (T, S, Z, J, L)
     best_3x2_shape = 'UNKNOWN'
     best_3x2_score = -999.0
     for name in ('T', 'S', 'Z', 'J', 'L'):
@@ -645,16 +703,17 @@ def main(args):
     candidate_shape = 'UNKNOWN'
     streak_count = 0
     spawn_locked = False
+    empty_sky_frames = 0
     last_valid_next = 'T'
     expected_spawn_piece = None
     next_vote_buffer = []
-    best_grid_snapshot = None
+    best_grid_snapshot = np.zeros((BOARD_ROWS, BOARD_COLS), dtype=int)
     frame_counter = 0
 
     trimmed_pf = get_trimmed_playfield_rect(pf_rel)
     block_size_px = trimmed_pf["width"] / float(BOARD_COLS)
 
-    print("\n🍓 AI Vision Engine Online (IMX708 Stack-Lock + Border-Proof Next Box)! Waiting for pieces...")
+    print("\n🍓 AI Vision Engine Online (IMX708 Grounded-Stack + Border-Proof Next Box)! Waiting for pieces...")
     print("💡 Controls: '+' / '-' = Manual Focus | 'a' = Autofocus | 't' = Test LEDs | 'q' = Quit\n")
 
     while True:
@@ -671,59 +730,66 @@ def main(args):
 
         if next_shape in PIECE_TEMPLATES:
             next_vote_buffer.append(next_shape)
-            if len(next_vote_buffer) > 3:
+            if len(next_vote_buffer) > 5:
                 next_vote_buffer.pop(0)
             last_valid_next = max(set(next_vote_buffer), key=next_vote_buffer.count)
 
         raw_settled = np.where(falling_mask == 1, 0, full_grid) if full_grid is not None else None
-        clean_settled = clean_settled_board(raw_settled) if raw_settled is not None else None
+        clean_settled = clean_settled_board(raw_settled, piece_in_flight=spawn_locked) if raw_settled is not None else None
 
         if falling_shape != 'UNKNOWN':
-            best_grid_snapshot = clean_settled.copy()
+            empty_sky_frames = 0
+            if not spawn_locked and clean_settled is not None:
+                best_grid_snapshot = clean_settled.copy()
             if falling_shape == candidate_shape:
                 streak_count += 1
             else:
                 candidate_shape = falling_shape
                 streak_count = 1
         else:
-            if full_grid is not None and np.sum(full_grid[:3, 2:8]) == 0:
-                if spawn_locked:
-                    expected_spawn_piece = last_valid_next
-                spawn_locked = False
-                streak_count = 0
-                candidate_shape = 'UNKNOWN'
+            # Require 2 consecutive frames of empty top spawn zone before unlocking for next piece
+            if full_grid is not None and np.sum(full_grid[:2, 3:7]) == 0:
+                empty_sky_frames += 1
+                if empty_sky_frames >= 2:
+                    if spawn_locked:
+                        expected_spawn_piece = last_valid_next
+                    if clean_settled is not None:
+                        best_grid_snapshot = clean_settled.copy()
+                    spawn_locked = False
+                    streak_count = 0
+                    candidate_shape = 'UNKNOWN'
 
-        if not spawn_locked and streak_count >= 1 and candidate_shape in PIECE_TEMPLATES:
-            if streak_count >= 2 or candidate_shape == expected_spawn_piece:
-                valid_next = last_valid_next
+        # Require 2 consistent frames of the same piece at spawn so transitional frames never misfire
+        if not spawn_locked and streak_count >= 2 and candidate_shape in PIECE_TEMPLATES:
+            valid_next = last_valid_next
 
-                top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
-                active_beam_width = 4 if top_half_occupied else 12
-                depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
+            top_half_occupied = bool(np.any(best_grid_snapshot[:10, :] == 1))
+            active_beam_width = 4 if top_half_occupied else 12
+            depth_label = "DEPTH-1.5 (FAST)" if top_half_occupied else "DEPTH-2 (FULL)"
 
-                needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
-                active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
-                mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
+            needs_cleanup = bool(np.any(best_grid_snapshot[:8, :] == 1))
+            active_dna = CLEANUP_DNA if needs_cleanup else CHAMPION_DNA
+            mode_label = "CLEANUP" if needs_cleanup else "TETRIS-WELL"
 
-                t0 = time.perf_counter()
-                best_move, _, _ = find_best_move(
-                    best_grid_snapshot.tolist(),
-                    candidate_shape,
-                    valid_next,
-                    active_dna,
-                    beam_width=active_beam_width
-                )
-                dt_ms = (time.perf_counter() - t0) * 1000.0
+            t0 = time.perf_counter()
+            best_move, _, _ = find_best_move(
+                best_grid_snapshot.tolist(),
+                candidate_shape,
+                valid_next,
+                active_dna,
+                beam_width=active_beam_width
+            )
+            dt_ms = (time.perf_counter() - t0) * 1000.0
 
-                print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
+            print(f"Verified Spawn: {candidate_shape} (Next: {valid_next}) [{depth_label} | {mode_label} | {dt_ms:.1f} ms | Cache: {len(BOARD_CACHE)}]")
 
-                if best_move:
-                    best_rot, best_col = best_move
-                    current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
-                    print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
-                    hw_controller.dispatch_sequence(current_instructions)
+            if best_move:
+                best_rot, best_col = best_move
+                current_instructions = sequencer.get_full_sequence(candidate_shape, best_rot, best_col)
+                print(f"AI COMMAND: {' -> '.join(current_instructions)}\n")
+                hw_controller.dispatch_sequence(current_instructions)
 
-                spawn_locked = True
+            spawn_locked = True
 
         if not args.headless and (frame_counter % 3 == 0):
             eff_left = trimmed_pf["left"]
