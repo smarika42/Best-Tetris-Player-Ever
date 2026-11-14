@@ -13,15 +13,17 @@ def get_column_heights(board):
 def calculate_board_height(board):
     heights = get_column_heights(board)
     main_heights = heights[:-1]
-    # Penalize overall height + highest column + height difference across the 9 main columns
     tower_span = max(main_heights) - min(main_heights)
     return sum(heights) + (max(heights) * 2.5) + (tower_span * 1.8)
 
 
 def count_holes(board):
     """
-    Counts empty cells buried under blocks, plus a roof penalty for every block sitting
-    above a hole so the AI actively uncovers holes instead of burying them deeper!
+    STRICT ZERO-HOLE DETECTOR:
+    1) Counts every empty cell underneath a block (buried hole).
+    2) Adds a heavy penalty for multiple blocks stacked over a hole (roof penalty).
+    3) Adds a canyon/overhang penalty if an empty cell is trapped between tall walls,
+       preventing Z, S, J, L, T from landing in orientations that leave unfillable gaps!
     """
     total_holes = 0.0
     rows = len(board)
@@ -35,7 +37,10 @@ def count_holes(board):
                 block_found = True
                 blocks_above += 1
             elif board[row][col] == 0 and block_found:
-                total_holes += 1.0 + (min(blocks_above, 5) * 0.20)
+                # Massive base hole count + extra weight if on the bottom rows (Rows 17..19)
+                bottom_multiplier = 1.5 if row >= rows - 3 else 1.0
+                total_holes += (1.0 * bottom_multiplier) + (min(blocks_above, 5) * 0.35)
+
     return total_holes
 
 
@@ -47,21 +52,23 @@ def calculate_bumpiness(board):
     # Measure bumpiness across the 9 main stack columns (Cols 0..8)
     for i in range(cols - 2):
         diff = abs(heights[i] - heights[i + 1])
-        # Penalize deep 2+ block canyons between columns 0..8 so it doesn't build narrow wells in the middle!
+        # Penalize 2+ block steps between adjacent columns so S/Z/J/L always lay flat!
         if diff >= 2:
-            total_bumpiness += diff * 1.75
+            total_bumpiness += diff * 2.5
         else:
             total_bumpiness += diff
 
-    # Extra penalty if an internal column (1..7) is a deep canyon surrounded by taller walls on both sides
-    for i in range(1, cols - 2):
-        wall_min = min(heights[i - 1], heights[i + 1])
+    # Extra penalty if an internal column (0..7) is a narrow 1-wide canyon surrounded by walls
+    for i in range(cols - 1):
+        left_h = heights[i - 1] if i > 0 else (heights[i] + 3)
+        right_h = heights[i + 1] if i + 1 < cols - 1 else (heights[i] + 3)
+        wall_min = min(left_h, right_h)
         if wall_min - heights[i] >= 2:
-            total_bumpiness += (wall_min - heights[i]) * 1.5
+            total_bumpiness += (wall_min - heights[i]) * 2.2
 
     # Heavy penalty if Column 9 (the right-hand Tetris well) is taller than Column 8
     if heights[cols - 1] > heights[cols - 2]:
-        total_bumpiness += (heights[cols - 1] - heights[cols - 2]) * 4.0
+        total_bumpiness += (heights[cols - 1] - heights[cols - 2]) * 5.0
 
     return total_bumpiness
 
@@ -80,9 +87,9 @@ def calculate_wells(board):
 
     # Strong penalty for dropping ANY block into Column 9 unless it clears lines
     if well_col_height > 0:
-        well_penalty = -4.5 * well_col_height
+        well_penalty = -6.0 * well_col_height
     else:
-        well_penalty = 2.5
+        well_penalty = 3.0
 
     true_depth = max(0.0, float(min_main - well_col_height))
     developing_depth = max(0.0, avg_main - well_col_height) * 0.5
